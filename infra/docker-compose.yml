@@ -1,0 +1,56 @@
+services:
+  database:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: frontdesk
+      POSTGRES_USER: frontdesk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-demo-database}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U frontdesk -d frontdesk"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  api:
+    build:
+      context: ..
+      dockerfile: services/api/Dockerfile
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg://frontdesk:${POSTGRES_PASSWORD:-local-demo-database}@database:5432/frontdesk
+      DEMO_MODE: ${DEMO_MODE:-true}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      database:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  web:
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+    environment:
+      API_URL: http://api:8000
+      NEXT_TELEMETRY_DISABLED: 1
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+  livekit:
+    image: livekit/livekit-server:v1.9
+    command: ["--dev", "--bind", "0.0.0.0"]
+    profiles: [local-voice]
+    ports:
+      - "127.0.0.1:7880:7880"
+      - "127.0.0.1:7881:7881"
+      - "127.0.0.1:7882:7882/udp"
+volumes:
+  postgres_data:

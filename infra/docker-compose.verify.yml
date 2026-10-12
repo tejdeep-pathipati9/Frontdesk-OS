@@ -1,0 +1,12 @@
+# Isolated verification stack, with ports separate from the native preview.
+services:
+  api:
+    ports: !override
+      - "127.0.0.1:18000:8000"
+    environment:
+      WEB_ORIGIN: http://127.0.0.1:13000
+  web:
+    ports: !override
+      - "127.0.0.1:13000:3000"
+    environment:
+      API_URL: http://api:8000

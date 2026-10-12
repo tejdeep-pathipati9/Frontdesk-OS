@@ -1,0 +1,4 @@
+# Optional worker. Keep voice model dependencies separate from the business API.
+livekit-agents[openai,silero]>=1.8,<2
+httpx>=0.28,<1
+python-dotenv>=1.0,<2

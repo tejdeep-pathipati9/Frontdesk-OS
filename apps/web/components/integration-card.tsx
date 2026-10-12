@@ -1,0 +1,12 @@
+import { Database, Plug, RefreshCw } from "lucide-react";
+import { Button } from "./ui/button";
+import { Badge } from "./workflows";
+import { Panel } from "./shared/panel";
+import { time } from "@/lib/api";
+import type { Integration } from "@/lib/types";
+
+export function IntegrationCard({ integration, timezone, busy, onTest }: { integration: Integration; timezone: string; busy: boolean; onTest?: () => void }) {
+  const c = integration;
+  const title = c.provider === "internal" ? "FrontDesk internal engine" : c.provider === "supabase" ? "Supabase" : c.provider === "square" ? "Square" : "Toast";
+  return <Panel title={title} action={<span className="provider-logo">{c.provider === "internal" || c.provider === "supabase" ? <Database size={18} /> : <Plug size={18} />}</span>}><div className="panel-body"><Badge status={c.mode}>{c.mode.replaceAll("_", " ")}</Badge><p className="integration-detail">{c.detail || (c.provider === "internal" ? "Persistent bookings and orders governed by shared capacity rules." : c.provider === "square" ? "Salon bookings, catalog, and location reads with authorized seller permissions." : "Restaurant menus and orders with authorized Toast access.")}</p><div className="capability-list">{Object.entries(c.capabilities).map(([capability, state]) => <div key={capability}><span>{capability.replaceAll("_", " ")}</span><Badge status={state}>{state.replaceAll("_", " ")}</Badge></div>)}</div><div className="integration-health"><small>Last tested</small><span>{c.last_tested_at ? time(c.last_tested_at, timezone, true) : "Not tested"}</span><small>Operational sync</small><span>{c.provider === "internal" ? "Current backend data" : c.provider === "supabase" && c.mode === "connected" ? "Via FastAPI · database connected" : "Not activated"}</span></div>{c.error_code && <div className="notice">{c.error_code.replaceAll("_", " ")}</div>}{onTest && <Button variant="outline" className="full-width" disabled={busy} onClick={onTest}><RefreshCw size={13} />Test connection</Button>}{["square", "toast"].includes(c.provider) && <small className="integration-note">Configure authorized credentials on the server. OAuth onboarding and operational import are not activated.</small>}{c.provider === "supabase" && c.mode !== "connected" && <small className="integration-note">Configuration is prepared. Supply the Supabase PostgreSQL connection string to FastAPI when the project is ready.</small>}</div></Panel>;
+}
