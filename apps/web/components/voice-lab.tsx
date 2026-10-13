@@ -10,6 +10,7 @@ export type VoiceMode = "vapi" | "livekit" | "ollama" | "tools";
 
 export default function VoiceLab({ data, refresh, initialMode }: { data: Snapshot; refresh: () => void; initialMode?: VoiceMode }) {
   const active = useRef(false);
+  const connectionId = useRef<string | null>(null);
   const [config, setConfig] = useState<VoiceConfig | null>(null);
   const mode = initialMode || data.location.settings.preferred_voice_provider || "vapi";
   const [connected, setConnected] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
@@ -23,11 +24,38 @@ export default function VoiceLab({ data, refresh, initialMode }: { data: Snapsho
   const [selectedItems, setSelectedItems] = useState<string[]>([]);
   const vapi = useRef<{ stop: () => void } | null>(null); const room = useRef<{ disconnect: () => void } | null>(null); const audioContainer = useRef<HTMLDivElement>(null);
   useEffect(() => { active.current = true; api<VoiceConfig>(`/voice/config?location_id=${data.location.id}`).then(value => { if (active.current) setConfig(value); }).catch(e => { if (active.current) setError(e.message); }); return () => { active.current = false; vapi.current?.stop(); room.current?.disconnect(); if (testRef.current) fetch(`/api/v1/voice/test-calls/${testRef.current}/end`, { method: "POST", keepalive: true }); }; }, [data.location.id]);
+  useEffect(() => {
+    if (!connected || mode !== "vapi") return;
+    let cancelled = false;
+    let checking = false;
+    const client = vapi.current;
+    const interval = setInterval(async () => {
+      if (checking) return;
+      checking = true;
+      try {
+        const status = await mutation<{ connection_id: string }>("/voice/vapi/readiness", { location_id: data.location.id });
+        if (status.connection_id !== connectionId.current) throw new Error("Voice connection changed");
+      }
+      catch {
+        if (!cancelled && active.current && vapi.current === client) {
+          setError("Voice connection was interrupted. Reconnect the service and start a new call.");
+          log("system", "Call stopped because the business connection was lost.");
+          client?.stop();
+          setConnected(false);
+          refresh();
+        }
+      } finally { checking = false; }
+    }, 15000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [connected, mode, data.location.id]);
   function log(role: string, text: string) { setMessages(m => [...m.slice(-39), { role, text }]); }
   async function startVoice() {
     setError(""); setBusy(true);
     try {
       if (mode === "vapi") {
+        const readiness = await mutation<{ connection_id: string }>("/voice/vapi/readiness", { location_id: data.location.id });
+        connectionId.current = readiness.connection_id;
+        if (!active.current) return;
         const { default: Vapi } = await import("@vapi-ai/web");
         if (!active.current) return;
         const client = new Vapi(config!.vapi.public_key);

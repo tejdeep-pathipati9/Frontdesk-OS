@@ -23,7 +23,6 @@ from .seed import seed, DEMO_TENANT, RESTAURANT, SALON
 from .providers import SquareAdapter, ToastAdapter
 from .tools import execute_tool, TOOLS, AGENT_PROMPT
 from .transcripts import start_retention, prune as prune_transcripts, retention_limit
-from .integration_normalization import Envelope as MockIntegrationEvent
 
 
 @asynccontextmanager
@@ -76,7 +75,6 @@ async def handle_domain(request, error):
     return JSONResponse({"code": error.code, "message": error.message, "retryable": error.retryable, "correlation_id": request.state.correlation_id, **({"decision": error.decision} if error.decision is not None else {})}, status_code=error.status)
 
 
-
 @app.exception_handler(RequestValidationError)
 async def handle_validation(request, error):
     return JSONResponse({"code": "VALIDATION_ERROR", "message": "Invalid request fields", "fields": [{"field": ".".join(map(str, e["loc"])), "message": e["msg"]} for e in error.errors()], "retryable": False, "correlation_id": request.state.correlation_id}, status_code=422)
@@ -107,7 +105,6 @@ def health():
     return {"status": "ok", "demo_mode": settings().demo_mode, "demo_login_enabled": settings().demo_mode and settings().allow_demo_login, "database": {"provider": provider, "connected": True}}
 
 
-
 @app.post("/api/v1/auth/login")
 def login(body: s.Login, response: Response):
     cfg = settings()
@@ -127,7 +124,6 @@ def login(body: s.Login, response: Response):
         data = {"tenant_id": member.tenant_id, "role": member.role, "email": member.email}
     response.set_cookie("frontdesk_session", token, httponly=True, secure=not cfg.demo_mode, samesite="strict", max_age=43200)
     return data
-
 
 
 @app.get("/api/v1/auth/me")
@@ -170,7 +166,6 @@ def create_location(body: s.LocationCreate, user=Depends(identity)):
         return serialize(loc)
 
 
-
 @app.get("/api/v1/locations/{location_id}")
 def read_location(location_id: str, user=Depends(identity)):
     with Session() as db:
@@ -198,8 +193,6 @@ def patch_settings(location_id: str, body: s.SettingsPatch, user=Depends(identit
             prune_transcripts(db, loc)
         emit(db, loc, "settings.updated", body.model_dump(exclude_none=True), user["id"])
         return serialize(loc)
-
-
 
 
 def scoped_list(db, model, loc):
@@ -231,13 +224,11 @@ def snapshot(location_id: str, user=Depends(identity)):
         return {"location": serialize(loc), "resources": [serialize(r) for r in resources(db, loc)], "services": [serialize(r) for r in scoped_list(db, Service, loc)], "menu": [serialize(r) for r in scoped_list(db, MenuItem, loc) if ids is None or r.id in ids], "reservations": [booking_dict(db, r) for r in bookings], "waitlist": [serialize(r) for r in scoped_list(db, WaitlistEntry, loc)], "orders": orders, "kitchen": serialize(kitchen) if kitchen else None, "calls": calls, "events": [serialize(r) for r in scoped_list(db, Event, loc)[:50]], "integration_health": [describe(db, loc, c) for c in connections], "as_of": now().isoformat()}
 
 
-
 @app.get("/api/v1/locations/{location_id}/tables")
 def list_tables(location_id: str, user=Depends(identity)):
     with Session() as db:
         from .domain import resources
         return [serialize(r) for r in resources(db, get_location(db, location_id, user)) if r.kind == "table"]
-
 
 
 @app.post("/api/v1/locations/{location_id}/tables/{table_id}/transitions")
@@ -273,7 +264,6 @@ def table_transition(location_id: str, table_id: str, body: s.TableTransition, u
         table.attributes = {**table.attributes, "staff_verified": True}
         emit(db, loc, "table.transitioned", {"table_id": table.id, "before": before, "after": table.state}, user["id"], table.id)
         return serialize(table)
-
 
 
 @app.post("/api/v1/availability/restaurant")
@@ -354,7 +344,6 @@ def change_reservation(id_: str, body: s.StatusPatch, user=Depends(identity)):
         return booking_dict(db, row)
 
 
-
 @app.post("/api/v1/reservations/{id_}/reschedule")
 @app.post("/api/v1/appointments/{id_}/reschedule")
 def reschedule(id_: str, body: s.Availability, user=Depends(identity)):
@@ -381,7 +370,6 @@ def reschedule(id_: str, body: s.Availability, user=Depends(identity)):
         db.flush()
         emit(db, loc, "reservation.rescheduled", {"start_at": result["start_at"]}, user["id"], row.id)
         return booking_dict(db, row)
-
 
 
 @app.get("/api/v1/waitlist")
@@ -445,7 +433,6 @@ def menu(location_id: str, user=Depends(identity)):
         return [serialize(r) for r in scoped_list(db, MenuItem, loc) if r.id in ids]
 
 
-
 @app.post("/api/v1/resources")
 def create_resource(body: s.ResourceCreate, user=Depends(identity)):
     require_role(user)
@@ -460,7 +447,6 @@ def create_resource(body: s.ResourceCreate, user=Depends(identity)):
         db.flush()
         emit(db, loc, "resource.created", {"id": row.id, "kind": row.kind}, user["id"], row.id)
         return serialize(row)
-
 
 
 @app.post("/api/v1/services")
@@ -507,7 +493,6 @@ def update_menu(id_: str, body: dict, user=Depends(identity)):
         return serialize(row)
 
 
-
 @app.patch("/api/v1/orders/{id_}")
 def change_order(id_: str, body: s.StatusPatch, user=Depends(identity)):
     require_role(user, "kitchen")
@@ -532,7 +517,6 @@ def change_order(id_: str, body: s.StatusPatch, user=Depends(identity)):
         row.state = body.status
         emit(db, get_location(db, row.location_id, user), "order.updated", {"state": row.state}, user["id"], row.id)
         return serialize(row)
-
 
 
 @app.patch("/api/v1/resources/{id_}")
@@ -593,7 +577,6 @@ def call_detail(id_: str, user=Depends(identity)):
         return result
 
 
-
 @app.get("/api/v1/audit-events")
 def audits(location_id: str, user=Depends(identity)):
     require_role(user)
@@ -633,6 +616,122 @@ def integrations(location_id: str, user=Depends(identity)):
     return result + additional
 
 
+@app.post("/api/v1/integrations/{provider}/connect")
+def connect_integration(provider: str, body: s.IntegrationConnect, user=Depends(identity)):
+    require_role(user)
+    from .integration_service import connect
+    with transaction() as db:
+        loc = get_location(db, body.location_id, user)
+        return connect(db, loc, provider, body.booking_authority, body.order_authority, body.scenario)
+
+
+@app.post("/api/v1/integrations/{provider}/sync")
+def sync_integration(provider: str, location_id: str, user=Depends(identity)):
+    require_role(user)
+    from .integration_service import connection, sync, describe
+    with transaction() as db:
+        loc = get_location(db, location_id, user)
+        conn = connection(db, loc, provider)
+        if not conn:
+            raise DomainError("NOT_CONFIGURED", "Select/import a provider first", 422)
+        sync(db, loc, conn)
+        return describe(db, loc, conn)
+
+
+from .integration_normalization import Envelope as MockIntegrationEvent
+
+
+@app.post("/api/v1/integrations/{provider}/mock-events")
+def ingest_mock_event(provider: str, body: MockIntegrationEvent, user=Depends(identity)):
+    require_role(user)
+    from .integration_service import require_adapter, context, apply_record
+    from .integration_normalization import normalize
+    from pydantic import ValidationError
+    with transaction() as db:
+        loc = get_location(db, body.location_id, user)
+        adapter, conn = require_adapter(db, loc, provider, require_fresh=False)
+        if loc.mode != "demo":
+            raise DomainError("MOCK_REQUIRES_DEMO", "Mock events are restricted to demo locations", 422)
+        key = f"{loc.id}:{body.event_id}"
+        source = f"mock:{provider}"
+        if db.scalar(select(Event.id).where(Event.source == source, Event.source_event_id == key, Event.tenant_id == loc.tenant_id)):
+            return {"status": "already_processed"}
+        if utc(body.observed_at) > now() + timedelta(seconds=30):
+            raise DomainError("INVALID_EVENT_TIME", "Future event timestamps are not accepted", 422)
+        try:
+            data = normalize(provider, body)
+        except ValidationError:
+            raise DomainError("INVALID_PROVIDER_PAYLOAD", "Provider event schema is invalid", 422)
+        remote = next((r for r in adapter.rows(db, context(loc, conn), body.kind) if r.external_id == body.external_id), None)
+        late = remote is not None and utc(remote.observed_at) > utc(body.observed_at)
+        if not late:
+            if not remote:
+                remote = adapter.add(db, context(loc, conn), body.kind, body.external_id, data)
+            remote.data, remote.observed_at = data, body.observed_at
+            apply_record(db, loc, conn, {"kind": body.kind, "external_id": body.external_id, "data": data, "observed_at": body.observed_at})
+        db.add(Event(tenant_id=loc.tenant_id, location_id=loc.id, source=source, source_event_id=key, type="integration.event_received", occurred_at=body.observed_at, payload={"provider": provider, "kind": body.kind, "external_id": body.external_id, "late": late}))
+        return {"status": "ignored_older_event" if late else "processed", "full_sync_refreshed": False}
+
+
+@app.post("/api/v1/integrations/{provider}/disconnect")
+def disconnect_integration(provider: str, location_id: str, user=Depends(identity)):
+    require_role(user)
+    from .integration_service import connection, choose_authority
+    with transaction() as db:
+        loc = get_location(db, location_id, user)
+        conn = connection(db, loc, provider)
+        if not conn:
+            raise DomainError("NOT_FOUND", "Connection not found", 404)
+        for key in ["booking_provider", "order_provider"]:
+            if loc.settings.get(key) == provider:
+                choose_authority(db, loc, key, "internal")
+        loc.settings = {k: v for k, v in loc.settings.items() if k not in ["floor_provider", "catalog_provider"] or v != provider}
+        conn.status = "disconnected"
+        emit(db, loc, "integration.disconnected", {"provider": provider}, user["id"])
+        return {"status": "disconnected"}
+
+
+@app.post("/api/v1/locations/{location_id}/booking-authority")
+def set_booking_authority(location_id: str, body: s.AuthoritySelection, user=Depends(identity)):
+    require_role(user)
+    from .integration_service import require_adapter, choose_authority
+    with transaction() as db:
+        loc = get_location(db, location_id, user)
+        for key, provider in body.model_dump().items():
+            if provider not in ["internal", "staff_requests"]:
+                require_adapter(db, loc, provider, "orders_write" if key == "order_provider" else "bookings_write")
+            if key == "order_provider" and provider != "internal" and loc.settings.get("catalog_provider") != provider:
+                raise DomainError("CATALOG_PROVIDER_CONFLICT", "Import the order provider's menu before selecting it")
+            choose_authority(db, loc, key, provider)
+        return serialize(loc)
+
+
+@app.post("/api/v1/capacity-requests")
+def staff_booking_request(body: s.StaffBookingRequest, user=Depends(identity)):
+    require_role(user, "host")
+    from .integration_service import request_staff_review
+    with transaction() as db:
+        return request_staff_review(db, get_location(db, body.location_id, user), body)
+
+
+@app.post("/api/v1/capacity-requests/{id_}/arrangement")
+def verify_arrangement(id_: str, body: s.SeatingArrangementReview, user=Depends(identity)):
+    require_role(user, "host")
+    with transaction() as db:
+        event = owned(db, Event, id_, user)
+        loc = get_location(db, event.location_id, user)
+        if event.type != "capacity.review_required" or loc.settings.get("booking_provider", "internal") not in ["internal", "staff_requests"]:
+            raise DomainError("PROVIDER_ARRANGEMENT_REQUIRED", "Manage seating arrangements in the configured booking provider", 422)
+        tables = [owned(db, Resource, id_, user) for id_ in body.resource_ids]
+        if len(set(body.resource_ids)) != len(body.resource_ids) or any(t.location_id != loc.id or t.kind != "table" or t.state == "out_of_service" for t in tables) or sum(t.capacity for t in tables) < event.payload["party_size"]:
+            raise DomainError("INVALID_ARRANGEMENT", "Select usable tables at this location that fit the requested party", 422)
+        groups = loc.settings.get("combinations", [])
+        if len(tables) > 1 and not any(set(group) == set(body.resource_ids) for group in groups):
+            groups = [*groups, body.resource_ids]
+        loc.settings = {**loc.settings, "combinations": groups, "arrangement_verifications": {**loc.settings.get("arrangement_verifications", {}), "+".join(sorted(body.resource_ids)): {"actor": user["id"], "verified_at": now().isoformat(), "request_id": event.id}}}
+        emit(db, loc, "attention.reviewed", {"decision": "arrangement_verified", "target": f"event:{event.id}", "resource_ids": body.resource_ids}, user["id"], f"event:{event.id}")
+        return {"status": "arrangement_verified", "booking_confirmed": False, "message": "Arrangement saved. Table-state verification and a confirmed booking are still required."}
+
 
 def integration_configuration_ref(provider):
     """Invalidate cached health when credentials or account configuration change."""
@@ -665,6 +764,20 @@ def voice_config(location_id: str, user=Depends(identity)):
     allowed = user["tenant_id"] == DEMO_TENANT and location_id in [RESTAURANT, SALON]
     return {"preferred_provider": loc.settings.get("preferred_voice_provider", "vapi"), "vapi": {"configured": allowed and bool(cfg.vapi_public_key and assistant and cfg.vapi_webhook_secret), "public_key": cfg.vapi_public_key if allowed else "", "assistant_id": assistant if allowed else "", "purpose": "Phone and web calls"}, "livekit": {"configured": allowed and bool(cfg.livekit_url and cfg.livekit_api_key and cfg.livekit_api_secret and cfg.agent_api_token), "purpose": "Self-hosted voice"}, "ollama": {"model": cfg.ollama_model}, "recordings_retained": False, "transcripts_retained": bool(retention_limit(loc)), "transcript_retention_calls": retention_limit(loc), "tools": TOOLS, "prompt": AGENT_PROMPT}
 
+
+@app.post("/api/v1/voice/vapi/readiness")
+def vapi_readiness(body: s.VoiceSession, user=Depends(identity)):
+    require_role(user, "host")
+    with Session() as db:
+        loc = get_location(db, body.location_id, user)
+    cfg = settings()
+    assistant = cfg.vapi_restaurant_assistant_id if loc.vertical == "restaurant" else cfg.vapi_salon_assistant_id
+    if user["tenant_id"] != DEMO_TENANT or loc.id not in [RESTAURANT, SALON] or not cfg.vapi_public_key or not assistant:
+        raise DomainError("VAPI_NOT_CONFIGURED", "Voice connection requires setup before starting a call.", 503)
+    from .voice_readiness import check_webhook
+    # Network I/O is outside the database transaction; this creates no call/action.
+    result = check_webhook(cfg.vapi_server_url, cfg.vapi_webhook_secret)
+    return {**result, "connection_id": hashlib.sha256(f"{cfg.vapi_server_url}|{assistant}".encode()).hexdigest()[:16]}
 
 
 @app.post("/api/v1/voice/test-calls")
@@ -723,8 +836,6 @@ def end_call(db, call):
     else:
         call.summary = {'failed': 'Request not completed. Staff review required.', 'escalated': 'Staff assistance requested.', 'information_only': 'Information provided. No booking or order created.'}.get(call.outcome, 'Call ended.')
     prune_transcripts(db, db.get(Location, call.location_id))
-
-
 
 
 @app.post("/api/v1/voice/test-calls/{id_}/end")
@@ -827,8 +938,6 @@ def vapi_webhook(body: dict, request: Request):
         return {"status": "processed"}
 
 
-
-
 @app.get("/api/v1/realtime")
 async def realtime(location_id: str, request: Request, user=Depends(identity)):
     with Session() as db:
@@ -870,7 +979,6 @@ def livekit_session(body: s.VoiceSession, user=Depends(identity)):
         return {"token": token, "url": cfg.livekit_url, "call_id": call.id}
 
 
-
 def agent_call(db, id_, request):
     supplied = request.headers.get("authorization", "").removeprefix("Bearer ")
     if not secret_matches(supplied, settings().agent_api_token):
@@ -889,7 +997,6 @@ def read_agent_call(id_: str, request: Request):
         return {"call_id": call.id, "status": call.status, "location_id": call.location_id, "prompt": AGENT_PROMPT, "transcript_notice": notice, "tools": TOOLS}
 
 
-
 @app.post("/api/v1/voice/agent/calls/{id_}/tools")
 def agent_tool(id_: str, body: s.ToolRequest, request: Request):
     if body.name == "commit_action":
@@ -899,7 +1006,6 @@ def agent_tool(id_: str, body: s.ToolRequest, request: Request):
         resolve(id_, Session)
     with transaction() as db:
         return execute_tool(db, agent_call(db, id_, request), body.name, body.arguments, body.request_id)
-
 
 
 @app.post("/api/v1/voice/agent/calls/{id_}/transcript")
@@ -918,8 +1024,6 @@ def agent_transcript(id_: str, body: s.TranscriptEvent, request: Request):
             observe_transcript(db, call, body.role, body.text)
         db.add(Event(tenant_id=call.tenant_id, location_id=call.location_id, source="livekit", source_event_id=key, type="call.transcript_processed", payload={"call_id": call.id, "role": body.role, "interrupted": body.interrupted}))
         return {"status": "processed"}
-
-
 
 
 @app.post("/api/v1/voice/agent/calls/{id_}/end")
@@ -1030,6 +1134,30 @@ def attention_queue(location_id: str, user=Depends(identity)):
         return sorted(result, key=lambda item: item["created_at"], reverse=True)
 
 
+@app.get('/api/v1/assistant/summary')
+def assistant_summary(location_id: str, user=Depends(identity)):
+    require_role(user, 'host')
+    from .assistant import summary
+    queue = attention_queue(location_id, user)
+    with Session() as db:
+        return summary(db, get_location(db, location_id, user), queue)
+
+
+@app.post('/api/v1/assistant/query')
+def assistant_query(body: s.AssistantQuery, user=Depends(identity)):
+    require_role(user, 'host')
+    from .assistant import interpret, answer
+    # Authorize BEFORE contacting the model. Its output never controls a tenant,
+    # database query language, business mutation, or final numeric answer.
+    with Session() as db:
+        get_location(db, body.location_id, user)
+    plan, engine = interpret(body.question)
+    data = snapshot(body.location_id, user)
+    queue = attention_queue(body.location_id, user)
+    with Session() as db:
+        result = answer(db, get_location(db, body.location_id, user), body.question, plan, queue, data)
+    return {**result, 'engine': engine}
+
 
 @app.post("/api/v1/attention/{target_id}/decision")
 def review_attention(target_id: str, body: s.AttentionDecision, user=Depends(identity)):
@@ -1064,144 +1192,3 @@ def review_attention(target_id: str, body: s.AttentionDecision, user=Depends(ide
             raise DomainError("NO_PENDING_TRANSACTION", "Use a new manual booking to complete this request", 422)
         emit(db, loc, "attention.reviewed", {"decision": body.decision, "target": target_id}, user["id"], target_id)
         return result
-
-
-
-@app.post("/api/v1/integrations/{provider}/connect")
-def connect_integration(provider: str, body: s.IntegrationConnect, user=Depends(identity)):
-    require_role(user)
-    from .integration_service import connect
-    with transaction() as db:
-        loc = get_location(db, body.location_id, user)
-        return connect(db, loc, provider, body.booking_authority, body.order_authority, body.scenario)
-
-
-@app.post("/api/v1/integrations/{provider}/sync")
-def sync_integration(provider: str, location_id: str, user=Depends(identity)):
-    require_role(user)
-    from .integration_service import connection, sync, describe
-    with transaction() as db:
-        loc = get_location(db, location_id, user)
-        conn = connection(db, loc, provider)
-        if not conn:
-            raise DomainError("NOT_CONFIGURED", "Select/import a provider first", 422)
-        sync(db, loc, conn)
-        return describe(db, loc, conn)
-
-
-@app.post("/api/v1/integrations/{provider}/mock-events")
-def ingest_mock_event(provider: str, body: MockIntegrationEvent, user=Depends(identity)):
-    require_role(user)
-    from .integration_service import require_adapter, context, apply_record
-    from .integration_normalization import normalize
-    from pydantic import ValidationError
-    with transaction() as db:
-        loc = get_location(db, body.location_id, user)
-        adapter, conn = require_adapter(db, loc, provider, require_fresh=False)
-        if loc.mode != "demo":
-            raise DomainError("MOCK_REQUIRES_DEMO", "Mock events are restricted to demo locations", 422)
-        key = f"{loc.id}:{body.event_id}"
-        source = f"mock:{provider}"
-        if db.scalar(select(Event.id).where(Event.source == source, Event.source_event_id == key, Event.tenant_id == loc.tenant_id)):
-            return {"status": "already_processed"}
-        if utc(body.observed_at) > now() + timedelta(seconds=30):
-            raise DomainError("INVALID_EVENT_TIME", "Future event timestamps are not accepted", 422)
-        try:
-            data = normalize(provider, body)
-        except ValidationError:
-            raise DomainError("INVALID_PROVIDER_PAYLOAD", "Provider event schema is invalid", 422)
-        remote = next((r for r in adapter.rows(db, context(loc, conn), body.kind) if r.external_id == body.external_id), None)
-        late = remote is not None and utc(remote.observed_at) > utc(body.observed_at)
-        if not late:
-            if not remote:
-                remote = adapter.add(db, context(loc, conn), body.kind, body.external_id, data)
-            remote.data, remote.observed_at = data, body.observed_at
-            apply_record(db, loc, conn, {"kind": body.kind, "external_id": body.external_id, "data": data, "observed_at": body.observed_at})
-        db.add(Event(tenant_id=loc.tenant_id, location_id=loc.id, source=source, source_event_id=key, type="integration.event_received", occurred_at=body.observed_at, payload={"provider": provider, "kind": body.kind, "external_id": body.external_id, "late": late}))
-        return {"status": "ignored_older_event" if late else "processed", "full_sync_refreshed": False}
-
-
-@app.post("/api/v1/integrations/{provider}/disconnect")
-def disconnect_integration(provider: str, location_id: str, user=Depends(identity)):
-    require_role(user)
-    from .integration_service import connection, choose_authority
-    with transaction() as db:
-        loc = get_location(db, location_id, user)
-        conn = connection(db, loc, provider)
-        if not conn:
-            raise DomainError("NOT_FOUND", "Connection not found", 404)
-        for key in ["booking_provider", "order_provider"]:
-            if loc.settings.get(key) == provider:
-                choose_authority(db, loc, key, "internal")
-        loc.settings = {k: v for k, v in loc.settings.items() if k not in ["floor_provider", "catalog_provider"] or v != provider}
-        conn.status = "disconnected"
-        emit(db, loc, "integration.disconnected", {"provider": provider}, user["id"])
-        return {"status": "disconnected"}
-
-
-@app.post("/api/v1/locations/{location_id}/booking-authority")
-def set_booking_authority(location_id: str, body: s.AuthoritySelection, user=Depends(identity)):
-    require_role(user)
-    from .integration_service import require_adapter, choose_authority
-    with transaction() as db:
-        loc = get_location(db, location_id, user)
-        for key, provider in body.model_dump().items():
-            if provider not in ["internal", "staff_requests"]:
-                require_adapter(db, loc, provider, "orders_write" if key == "order_provider" else "bookings_write")
-            if key == "order_provider" and provider != "internal" and loc.settings.get("catalog_provider") != provider:
-                raise DomainError("CATALOG_PROVIDER_CONFLICT", "Import the order provider's menu before selecting it")
-            choose_authority(db, loc, key, provider)
-        return serialize(loc)
-
-
-@app.post("/api/v1/capacity-requests")
-def staff_booking_request(body: s.StaffBookingRequest, user=Depends(identity)):
-    require_role(user, "host")
-    from .integration_service import request_staff_review
-    with transaction() as db:
-        return request_staff_review(db, get_location(db, body.location_id, user), body)
-
-
-@app.post("/api/v1/capacity-requests/{id_}/arrangement")
-def verify_arrangement(id_: str, body: s.SeatingArrangementReview, user=Depends(identity)):
-    require_role(user, "host")
-    with transaction() as db:
-        event = owned(db, Event, id_, user)
-        loc = get_location(db, event.location_id, user)
-        if event.type != "capacity.review_required" or loc.settings.get("booking_provider", "internal") not in ["internal", "staff_requests"]:
-            raise DomainError("PROVIDER_ARRANGEMENT_REQUIRED", "Manage seating arrangements in the configured booking provider", 422)
-        tables = [owned(db, Resource, id_, user) for id_ in body.resource_ids]
-        if len(set(body.resource_ids)) != len(body.resource_ids) or any(t.location_id != loc.id or t.kind != "table" or t.state == "out_of_service" for t in tables) or sum(t.capacity for t in tables) < event.payload["party_size"]:
-            raise DomainError("INVALID_ARRANGEMENT", "Select usable tables at this location that fit the requested party", 422)
-        groups = loc.settings.get("combinations", [])
-        if len(tables) > 1 and not any(set(group) == set(body.resource_ids) for group in groups):
-            groups = [*groups, body.resource_ids]
-        loc.settings = {**loc.settings, "combinations": groups, "arrangement_verifications": {**loc.settings.get("arrangement_verifications", {}), "+".join(sorted(body.resource_ids)): {"actor": user["id"], "verified_at": now().isoformat(), "request_id": event.id}}}
-        emit(db, loc, "attention.reviewed", {"decision": "arrangement_verified", "target": f"event:{event.id}", "resource_ids": body.resource_ids}, user["id"], f"event:{event.id}")
-        return {"status": "arrangement_verified", "booking_confirmed": False, "message": "Arrangement saved. Table-state verification and a confirmed booking are still required."}
-
-
-@app.get('/api/v1/assistant/summary')
-def assistant_summary(location_id: str, user=Depends(identity)):
-    require_role(user, 'host')
-    from .assistant import summary
-    queue = attention_queue(location_id, user)
-    with Session() as db:
-        return summary(db, get_location(db, location_id, user), queue)
-
-
-@app.post('/api/v1/assistant/query')
-def assistant_query(body: s.AssistantQuery, user=Depends(identity)):
-    require_role(user, 'host')
-    from .assistant import interpret, answer
-    # Authorize BEFORE contacting the model. Its output never controls a tenant,
-    # database query language, business mutation, or final numeric answer.
-    with Session() as db:
-        get_location(db, body.location_id, user)
-    plan, engine = interpret(body.question)
-    data = snapshot(body.location_id, user)
-    queue = attention_queue(body.location_id, user)
-    with Session() as db:
-        result = answer(db, get_location(db, body.location_id, user), body.question, plan, queue, data)
-    return {**result, 'engine': engine}
-

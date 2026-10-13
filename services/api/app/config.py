@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     web_origin: str = "http://127.0.0.1:3000"
     vapi_webhook_secret: str = ""
     vapi_public_key: str = ""
+    vapi_server_url: str = ""
     vapi_restaurant_assistant_id: str = ""
     vapi_salon_assistant_id: str = ""
     livekit_url: str = ""
