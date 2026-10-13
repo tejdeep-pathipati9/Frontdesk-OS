@@ -189,6 +189,11 @@ class ChatTurn(StrictModel):
     text: str = Field(min_length=1, max_length=2000)
 
 
+class AssistantQuery(StrictModel):
+    location_id: str
+    question: str = Field(min_length=1, max_length=2000)
+
+
 class LookupRequest(StrictModel):
     reference: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9-]+$")
     phone: str = Field(min_length=1, max_length=80, pattern=r"^[+\d\s().-]+$")

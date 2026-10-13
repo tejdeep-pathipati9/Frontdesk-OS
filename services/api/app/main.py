@@ -1180,3 +1180,28 @@ def verify_arrangement(id_: str, body: s.SeatingArrangementReview, user=Depends(
         emit(db, loc, "attention.reviewed", {"decision": "arrangement_verified", "target": f"event:{event.id}", "resource_ids": body.resource_ids}, user["id"], f"event:{event.id}")
         return {"status": "arrangement_verified", "booking_confirmed": False, "message": "Arrangement saved. Table-state verification and a confirmed booking are still required."}
 
+
+@app.get('/api/v1/assistant/summary')
+def assistant_summary(location_id: str, user=Depends(identity)):
+    require_role(user, 'host')
+    from .assistant import summary
+    queue = attention_queue(location_id, user)
+    with Session() as db:
+        return summary(db, get_location(db, location_id, user), queue)
+
+
+@app.post('/api/v1/assistant/query')
+def assistant_query(body: s.AssistantQuery, user=Depends(identity)):
+    require_role(user, 'host')
+    from .assistant import interpret, answer
+    # Authorize BEFORE contacting the model. Its output never controls a tenant,
+    # database query language, business mutation, or final numeric answer.
+    with Session() as db:
+        get_location(db, body.location_id, user)
+    plan, engine = interpret(body.question)
+    data = snapshot(body.location_id, user)
+    queue = attention_queue(body.location_id, user)
+    with Session() as db:
+        result = answer(db, get_location(db, body.location_id, user), body.question, plan, queue, data)
+    return {**result, 'engine': engine}
+
