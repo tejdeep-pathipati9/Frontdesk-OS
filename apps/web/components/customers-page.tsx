@@ -1,4 +1,5 @@
 "use client";
+// Customers screen: masked contact list with booking/order history.
 import { useCallback, useEffect, useState } from "react";
 import { Search, Pencil } from "lucide-react";
 import { api, mutation, time } from "@/lib/api";

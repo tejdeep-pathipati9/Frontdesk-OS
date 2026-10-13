@@ -1,4 +1,5 @@
 "use client";
+// Call history list for the AI receptionist.
 import { useState } from "react";
 import { ArrowDownLeft, ChevronRight, Search } from "lucide-react";
 import { Badge, Empty } from "./workflows";

@@ -1,4 +1,5 @@
 "use client";
+// Top-level dashboard container: auth gate, workspace data, section routing and global dialogs.
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Check, Loader2, Plus, X } from "lucide-react";
@@ -23,6 +24,7 @@ import { BookingForm, Empty, OrderForm } from "./workflows";
 import { Button } from "./ui/button";
 import { Dialog } from "./ui/dialog";
 
+/** Dashboard root for a vertical/section: handles login, loads the workspace and renders the matching page. */
 export default function Dashboard({ vertical, section }: { vertical: "restaurant" | "salon"; section: string }) {
   const router = useRouter(); const workspace = useWorkspace(vertical);
   const { auth, locations, locationId, data, attention, voice, error, setError, refresh, load } = workspace;
@@ -58,7 +60,7 @@ export default function Dashboard({ vertical, section }: { vertical: "restaurant
     {["floor", "staff"].includes(section) && !(section === "floor" && data?.location.settings.floor_provider) && <Button variant="outline" onClick={() => setNewResource(true)}><Plus size={14} />{section === "floor" ? "Add table" : "Add stylist"}</Button>}
     {section === "services" && <Button variant="outline" onClick={() => setNewService(true)}><Plus size={14} />Add service</Button>}
   </>;
-  return <><DashboardLayout vertical={vertical} section={section} location={data?.location} locations={locations} attentionCount={attention.length} onSelectLocation={selectLocation} onCreateLocation={() => setNewLocation(true)} onLogout={logout} onRefresh={() => { void refresh(); }} onAttention={() => router.push(`/app/${vertical}/attention`)} actions={controls}>
+  return <><DashboardLayout userName={workspace.userName} vertical={vertical} section={section} location={data?.location} locations={locations} attentionCount={attention.length} onSelectLocation={selectLocation} onCreateLocation={() => setNewLocation(true)} onLogout={logout} onRefresh={() => { void refresh(); }} onAttention={() => router.push(`/app/${vertical}/attention`)} actions={controls}>
     {!locationId ? <Empty title={`Create your first ${vertical} location`} detail="Add a location to get started." action={<Button onClick={() => setNewLocation(true)}>Create location</Button>} /> : !data ? <div className="loading-panel"><Loader2 size={20} className="spin" />Loading workspace…</div> : <>
       {section === "overview" && <DashboardOverview data={data} attention={attention} voice={voice} onTable={table => setTableId(table.id)} onCall={id => { void openCall(id); }} onUpdated={() => { void refresh(); }} onPause={() => { void act(`/locations/${locationId}`, { intake_paused: !data.location.settings.intake_paused }, "PATCH", data.location.settings.intake_paused ? "New requests resumed" : "New requests paused"); }} />}
       {section === "floor" && <FloorPlan data={data} onSelect={table => setTableId(table.id)} onAdd={data.location.settings.floor_provider ? undefined : () => setNewResource(true)} />}

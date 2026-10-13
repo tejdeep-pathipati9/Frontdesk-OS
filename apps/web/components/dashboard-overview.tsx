@@ -1,4 +1,5 @@
 "use client";
+// Overview section: metrics, attention queue, floor and activity summary.
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
@@ -103,10 +104,10 @@ export function DashboardOverview(props: OverviewProps) {
   const active = data.orders.filter(order => ["accepted", "preparing", "ready"].includes(order.state));
   const nextPickup = active.sort((a, b) => a.pickup_min.localeCompare(b.pickup_min))[0];
   const kitchen = data.kitchen;
-  const kitchenFresh = !!kitchen && Date.now() - Date.parse(kitchen.verified_at) <= data.location.settings.freshness_minutes * 60000;
+  const kitchenFresh = !!kitchen && (data.location.settings.staff_state_persistent || Date.now() - Date.parse(kitchen.verified_at) <= data.location.settings.freshness_minutes * 60000);
   const takeoutEnabled = kitchen?.kitchen_open && kitchen.accepting_takeout && !data.location.settings.intake_paused;
-  const kitchenLabel = !kitchen ? "Not configured" : data.location.settings.intake_paused ? "Requests paused" : !kitchen.kitchen_open ? "Closed" : !kitchen.accepting_takeout ? "Orders paused" : !kitchenFresh ? "Needs verification" : "Takeout enabled";
-  const waitValue = estimateState === "loading" ? "Updating…" : estimateState === "error" ? "Unavailable" : estimate?.wait_minutes ? `${estimate.wait_minutes.min}–${estimate.wait_minutes.max} min` : estimate?.status === "AVAILABLE_NOW" ? "Available now" : estimate?.status === "NO_CAPACITY" ? "No capacity" : "Needs verification";
+  const kitchenLabel = !kitchen ? "Not configured" : data.location.settings.intake_paused ? "Requests paused" : !kitchen.kitchen_open ? "Closed" : !kitchen.accepting_takeout ? "Orders paused" : !kitchenFresh ? "Status unavailable" : "Takeout enabled";
+  const waitValue = estimateState === "loading" ? "Updating…" : estimateState === "error" ? "Unavailable" : estimate?.wait_minutes ? `${estimate.wait_minutes.min}–${estimate.wait_minutes.max} min` : estimate?.status === "AVAILABLE_NOW" ? "Available now" : estimate?.status === "NO_CAPACITY" ? "No capacity" : "Status unavailable";
   const waitTitle = estimate?.evidence ? `${estimate.evidence.sources.join(", ").replaceAll("_", " ")} · ${estimate.evidence.confidence} confidence · ${time(estimate.evidence.as_of, zone, true)}` : "Seating estimate";
 
   return <div className="operations-overview">
@@ -130,7 +131,7 @@ export function DashboardOverview(props: OverviewProps) {
         <div className="operations-table-grid">{(restaurant ? tables : data.resources).map(resource => {
           const unverified = restaurant && (resource.attributes.staff_verified === false || isStale(resource, data));
           const state = unverified && resource.state === "available" ? "unverified" : resource.state;
-          const label = state === "unverified" ? "verify" : state === "available" ? "ready" : tableStateLabel(state).toLowerCase();
+          const label = state === "unverified" ? "unknown" : state === "available" ? "ready" : tableStateLabel(state).toLowerCase();
           if (!restaurant) return <Link className={`operations-table table-${state}`} href={`${root}/staff`} key={resource.id}><strong>{resource.name}</strong><span>{resource.state === "available" ? "available" : "unavailable"}</span></Link>;
           return <button className={`operations-table table-${state}`} key={resource.id} onClick={() => onTable(resource)} aria-label={`${resource.name}, ${resource.capacity} seats, ${label}${unverified && state !== "unverified" ? ", needs verification" : ""}`} title={unverified ? "Staff verification required" : `${resource.capacity} seats`}><strong>{resource.name}</strong><span>{label}</span></button>;
         })}{!(restaurant ? tables : data.resources).length && <p className="operations-empty">No resources configured.</p>}</div>

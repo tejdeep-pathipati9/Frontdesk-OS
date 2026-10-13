@@ -1,4 +1,5 @@
 "use client";
+// Day calendar of salon appointments by staff member.
 import { useState, useRef, useEffect } from "react";
 import { ChevronLeft, ChevronRight, Clock3 } from "lucide-react";
 import { Button } from "./ui/button";

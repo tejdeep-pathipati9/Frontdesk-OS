@@ -1,4 +1,5 @@
 "use client";
+// Queue of items needing staff attention (stale state, failed actions, follow-ups).
 import { useState } from "react";
 import { Bell, Check, ChevronRight, Clock3, ShieldCheck, X } from "lucide-react";
 import { Badge, Empty, ErrorText } from "./workflows";

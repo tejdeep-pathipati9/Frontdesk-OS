@@ -1,15 +1,18 @@
 "use client";
+// Hook that loads and refreshes workspace state (snapshot, locations, attention, voice) for a vertical.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import type { AttentionItem, Location, Snapshot, VoiceConfig } from "@/lib/types";
 
+/** Load and keep fresh the workspace (snapshot, locations, attention items, voice config) for a vertical; exposes refresh and error state. */
 export function useWorkspace(vertical: "restaurant" | "salon") {
+  const [userName, setUserName] = useState("");
   const [auth, setAuth] = useState<"loading" | "signed_in" | "signed_out">("loading");
   const [locations, setLocations] = useState<Location[]>([]); const [locationId, setLocationId] = useState("");
   const [data, setData] = useState<Snapshot | null>(null); const [attention, setAttention] = useState<AttentionItem[]>([]); const [voice, setVoice] = useState<VoiceConfig | null>(null);
   const [error, setError] = useState(""); const [realtime, setRealtime] = useState("connecting"); const refreshId = useRef(0);
   const load = useCallback(async () => {
-    try { await api("/auth/me"); const rows = await api<Location[]>("/locations"); setLocations(rows); const stored = sessionStorage.getItem(`frontdesk-${vertical}-location`); const preferred = rows.find(r => r.id === stored && r.vertical === vertical) || rows.find(r => r.vertical === vertical); setLocationId(preferred?.id || ""); setAuth("signed_in"); setError(""); } catch (e) { setAuth("signed_out"); if ((e as ApiError).status !== 401) setError((e as Error).message); }
+    try { const user = await api<{ display_name: string }>("/auth/me"); setUserName(user.display_name); const rows = await api<Location[]>("/locations"); setLocations(rows); const stored = sessionStorage.getItem(`frontdesk-${vertical}-location`); const preferred = rows.find(r => r.id === stored && r.vertical === vertical) || rows.find(r => r.vertical === vertical); setLocationId(preferred?.id || ""); setAuth("signed_in"); setError(""); } catch (e) { setAuth("signed_out"); if ((e as ApiError).status !== 401) setError((e as Error).message); }
   }, [vertical]);
   useEffect(() => { void load(); }, [load]);
   const refresh = useCallback(async () => {
@@ -31,5 +34,5 @@ export function useWorkspace(vertical: "restaurant" | "salon") {
     const interval = setInterval(() => { void refresh(); }, 15000);
     return () => { events.close(); clearInterval(interval); ++refreshId.current; };
   }, [locationId, refresh]);
-  return { auth, setAuth, locations, locationId, setLocationId, data, attention, voice, error, setError, realtime, refresh, load };
+  return { auth, setAuth, userName, locations, locationId, setLocationId, data, attention, voice, error, setError, realtime, refresh, load };
 }

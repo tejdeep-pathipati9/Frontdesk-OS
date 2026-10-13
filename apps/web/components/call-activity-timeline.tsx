@@ -1,3 +1,4 @@
+// Timeline of tool calls and outcomes within a single call detail.
 import { Check, X, Wrench, CalendarDays, ShoppingBag, Clock3 } from "lucide-react";
 import { Badge } from "./workflows";
 import { time, money } from "@/lib/api";

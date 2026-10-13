@@ -1,9 +1,11 @@
 "use client";
+// Generic sortable, paginated table component.
 import { useEffect, useState, type ReactNode } from "react";
 import { ArrowDown, ArrowUp, ChevronsUpDown, ChevronLeft, ChevronRight } from "lucide-react";
 import { Button } from "../ui/button";
 
 export type Column<T> = { key: string; title: string; render: (row: T) => ReactNode; sortValue?: (row: T) => string | number; className?: string };
+/** Generic table with client-side sorting and pagination; columns supply render and optional sortValue. */
 export function DataTable<T>({ rows, columns, rowKey, onRowClick, empty, pageSize = 10 }: { rows: T[]; columns: Column<T>[]; rowKey: (row: T) => string; onRowClick?: (row: T) => void; empty?: ReactNode; pageSize?: number }) {
   const [sort, setSort] = useState<{ key: string; descending: boolean } | null>(null);
   const [page, setPage] = useState(0);

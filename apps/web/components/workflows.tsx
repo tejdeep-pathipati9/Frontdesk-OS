@@ -1,4 +1,5 @@
 "use client";
+// Shared status badge/empty/error primitives plus the booking and order creation forms (prepare, readback, confirm).
 import { useState } from "react";
 import { Check, ArrowRight, Loader2, Plus, Minus } from "lucide-react";
 import { Button } from "./ui/button";
@@ -6,6 +7,7 @@ import { Dialog } from "./ui/dialog";
 import { api, mutation, money, localInput, localToISO, time } from "@/lib/api";
 import type { Snapshot, Proposal, Decision, Booking } from "@/lib/types";
 
+/** Colored status pill. */
 export function Badge({ children, status = "" }: { children: React.ReactNode; status?: string }) {
   const green = ["available", "confirmed", "accepted", "ready", "fulfilled", "supported", "AVAILABLE", "AVAILABLE_NOW", "connected_read_write"].includes(status);
   const red = ["failed", "out_of_service", "cancelled", "NO_CAPACITY", "degraded", "blocked"].includes(status);
@@ -15,6 +17,7 @@ export function Badge({ children, status = "" }: { children: React.ReactNode; st
 export function Empty({ title, detail, action }: { title: string; detail?: string; action?: React.ReactNode }) { return <div className="empty"><div className="empty-symbol"><Plus size={22} /></div><h3>{title}</h3>{detail && <p>{detail}</p>}{action}</div>; }
 export function ErrorText({ error }: { error: string }) { return error ? <div role="alert" className="error-text">{error}</div> : null; }
 
+/** Create or edit a booking via prepare -> readback -> confirm, supporting reservations and salon appointments. */
 export function BookingForm({ data, open, onClose, onSuccess, editing }: { data: Snapshot; open: boolean; onClose: () => void; onSuccess: (message: string) => void; editing?: Booking }) {
   const [name, setName] = useState(editing?.customer_name || "");
   const [phone, setPhone] = useState("");
@@ -51,6 +54,7 @@ export function BookingForm({ data, open, onClose, onSuccess, editing }: { data:
 }
 
 type Cart = Record<string, { quantity: number; modifiers: string[] }>;
+/** Create a takeout/dine-in order via the prepare/confirm flow. */
 export function OrderForm({ data, open, onClose, onSuccess }: { data: Snapshot; open: boolean; onClose: () => void; onSuccess: (message: string) => void }) {
   const [cart, setCart] = useState<Cart>({}); const [name, setName] = useState(""); const [proposal, setProposal] = useState<Proposal | null>(null); const [error, setError] = useState(""); const [busy, setBusy] = useState(false);
   function quantity(id: string, delta: number) { setCart(c => ({ ...c, [id]: { quantity: Math.max(0, (c[id]?.quantity || 0) + delta), modifiers: c[id]?.modifiers || [] } })); }

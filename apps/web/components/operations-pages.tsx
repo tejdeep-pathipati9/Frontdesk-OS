@@ -1,6 +1,7 @@
 "use client";
+// Waitlist, menu availability, staff and services management pages.
 import { useState } from "react";
-import { Clock3, Scissors, Users } from "lucide-react";
+import { Clock3, Scissors, Search, Users } from "lucide-react";
 import { Panel } from "./shared/panel";
 import { DataTable, type Column } from "./shared/data-table";
 import { Provenance } from "./shared/provenance";
@@ -25,16 +26,18 @@ export function WaitlistPage({ data, onUpdated, onSeat }: { data: Snapshot; onUp
 }
 
 export function MenuPage({ data, onToggle, busy }: { data: Snapshot; onToggle: (id: string, available: boolean) => void; busy: boolean }) {
-  const [category, setCategory] = useState("all"); const categories = [...new Set(data.menu.map(item => item.category))];
+  const [query, setQuery] = useState("");
+  const [category, setCategory] = useState("all"); const categories = [...new Set(data.menu.map(item => item.category))].sort((a, b) => ["Starters", "Mains", "Sides", "Desserts", "Drinks"].indexOf(a) - ["Starters", "Mains", "Sides", "Desserts", "Drinks"].indexOf(b));
   const columns: Column<Snapshot["menu"][number]>[] = [
     { key: "name", title: "Menu item", sortValue: item => item.name, render: item => <><strong>{item.name}</strong><small>{item.description}</small></> },
     { key: "category", title: "Category", render: item => item.category },
     { key: "price", title: "Price", sortValue: item => item.price_minor, render: item => money(item.price_minor) },
     { key: "modifiers", title: "Modifiers", render: item => <div className="modifier-list">{item.modifiers.length ? item.modifiers.map(modifier => <span key={modifier.id}>{modifier.name}{modifier.price_minor > 0 ? ` +${money(modifier.price_minor)}` : ""}</span>) : <span className="muted">None</span>}</div> },
-    { key: "work", title: "Prep load", render: item => item.work_units },
+    { key: "work", title: "Kitchen workload", render: item => item.work_units },
     { key: "available", title: "Available", render: item => <button role="switch" aria-checked={item.available} aria-label={`${item.name} availability`} className={`switch ${item.available ? "on" : ""}`} disabled={busy} onClick={() => onToggle(item.id, !item.available)}><span /></button> },
   ];
-  return <><div className="filter-row"><div className="segmented"><button className={category === "all" ? "selected" : ""} onClick={() => setCategory("all")}>All items</button>{categories.map(c => <button key={c} className={category === c ? "selected" : ""} onClick={() => setCategory(c)}>{c}</button>)}</div><Provenance source={data.location.settings.catalog_provider ? "connected_system" : "internal"} /></div><Panel title="Menu catalog"><DataTable rows={data.menu.filter(item => category === "all" || item.category === category)} columns={columns} rowKey={item => item.id} empty={<Empty title="No menu items" detail="Connect a menu provider in Integrations." />} /></Panel></>;
+  const rows = data.menu.filter(item => (category === "all" || item.category === category) && `${item.name} ${item.description}`.toLowerCase().includes(query.toLowerCase()));
+  return <><div className="filter-row"><div className="segmented"><button className={category === "all" ? "selected" : ""} onClick={() => setCategory("all")}>All items</button>{categories.map(c => <button key={c} className={category === c ? "selected" : ""} onClick={() => setCategory(c)}>{c}</button>)}</div><Provenance source={data.location.settings.catalog_provider ? "connected_system" : "internal"} /></div><div className="filter-row"><div className="search-field"><Search size={14} /><input aria-label="Search menu" placeholder="Search dishes…" value={query} onChange={event => setQuery(event.target.value)} /></div><span className="muted text-small">{data.menu.filter(item => item.available).length} available · {data.menu.length} items</span></div><Panel title="Restaurant menu"><DataTable rows={rows} columns={columns} rowKey={item => item.id} empty={<Empty title={data.menu.length ? "No matching dishes" : "No menu items"} detail={data.menu.length ? "Try another search or category." : "Connect a menu provider in Integrations."} />} /></Panel></>;
 }
 
 export function StaffPage({ data, onEdit, onToggle, busy }: { data: Snapshot; onEdit: (resource: Resource) => void; onToggle: (resource: Resource) => void; busy: boolean }) {

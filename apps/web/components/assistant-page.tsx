@@ -1,4 +1,5 @@
 "use client";
+// Read-only AI assistant chat answering operational questions from live data.
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { ArrowUp, CalendarDays, ChevronRight, CircleHelp, Loader2, MessageSquare, Phone, Sparkles } from "lucide-react";

@@ -1,10 +1,12 @@
 "use client";
+// Dashboard chrome: sidebar, header, account menu and mobile drawer around page content.
 import { useEffect, useState, type ReactNode } from "react";
 import { Bell, PanelLeft, RefreshCw } from "lucide-react";
 import { AppSidebar, pageTitles } from "./app-sidebar";
 import type { Location } from "@/lib/types";
 
-export function DashboardLayout({ vertical, section, location, locations, attentionCount, onSelectLocation, onCreateLocation, onLogout, onRefresh, onAttention, actions, children }: { vertical: "restaurant" | "salon"; section: string; location?: Location; locations: Location[]; attentionCount: number; onSelectLocation: (loc: Location) => void; onCreateLocation: () => void; onLogout: () => void; onRefresh: () => void; onAttention: () => void; actions?: ReactNode; children: ReactNode }) {
+/** Shell composing sidebar, header and content area. */
+export function DashboardLayout({ userName, vertical, section, location, locations, attentionCount, onSelectLocation, onCreateLocation, onLogout, onRefresh, onAttention, actions, children }: { userName: string; vertical: "restaurant" | "salon"; section: string; location?: Location; locations: Location[]; attentionCount: number; onSelectLocation: (loc: Location) => void; onCreateLocation: () => void; onLogout: () => void; onRefresh: () => void; onAttention: () => void; actions?: ReactNode; children: ReactNode }) {
   const [collapsed, setCollapsed] = useState(false); const [mobileOpen, setMobileOpen] = useState(false);
   useEffect(() => { setCollapsed(localStorage.getItem("frontdesk-sidebar-collapsed") === "true"); }, []);
   function toggle() { if (window.innerWidth < 768) setMobileOpen(v => !v); else setCollapsed(v => { localStorage.setItem("frontdesk-sidebar-collapsed", String(!v)); return !v; }); }
@@ -12,7 +14,7 @@ export function DashboardLayout({ vertical, section, location, locations, attent
   const recordLayout = ["reservations", "calendar", "waitlist", "orders", "calls"].includes(section);
   return <div className={`app-shell ${collapsed ? "shell-collapsed" : ""}`}>
     <a className="skip-link" href="#main-content">Skip to content</a>
-    <AppSidebar vertical={vertical} section={section} location={location} locations={locations} collapsed={collapsed} mobileOpen={mobileOpen} attentionCount={attentionCount} onToggle={toggle} onNavigate={() => setMobileOpen(false)} onSelect={onSelectLocation} onCreate={onCreateLocation} onLogout={onLogout} />
+    <AppSidebar userName={userName} vertical={vertical} section={section} location={location} locations={locations} collapsed={collapsed} mobileOpen={mobileOpen} attentionCount={attentionCount} onToggle={toggle} onNavigate={() => setMobileOpen(false)} onSelect={onSelectLocation} onCreate={onCreateLocation} onLogout={onLogout} />
     {mobileOpen && <button className="nav-scrim" aria-label="Close navigation" onClick={() => setMobileOpen(false)} />}
     <div className={`app-main ${vertical === "restaurant" && section === "overview" ? "restaurant-overview" : ""}`}>
       <header className="topbar">

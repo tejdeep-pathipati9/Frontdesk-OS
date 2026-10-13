@@ -1,4 +1,5 @@
 "use client";
+// Reservations list screen (table of bookings with edit/cancel actions).
 import { useState } from "react";
 import { CalendarDays, List, Search } from "lucide-react";
 import { Badge, Empty } from "./workflows";

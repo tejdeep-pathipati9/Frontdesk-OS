@@ -1,4 +1,5 @@
 "use client";
+// Admin dialogs/forms for kitchen capacity, settings, staff, resources, services and locations.
 import { useState } from "react";
 import { Check, Plus, X } from "lucide-react";
 import { Button } from "./ui/button";

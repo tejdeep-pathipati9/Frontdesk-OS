@@ -1,15 +1,23 @@
 "use client";
+// Voice lab for exercising Vapi, LiveKit, Ollama text chat and raw tool endpoints.
 import { useEffect, useRef, useState } from "react";
-import { Mic, PhoneOff, ArrowRight, Check, Loader2, AudioLines } from "lucide-react";
+import { Mic, PhoneOff, ArrowRight, Check, Loader2, AudioLines, Volume2 } from "lucide-react";
 import { Button } from "./ui/button";
 import { Badge, ErrorText } from "./workflows";
 import { api, mutation, localInput, localToISO } from "@/lib/api";
+import type VapiClient from "@vapi-ai/web";
+import { CallPlayback, startVoiceClient, stopVoiceClient, waitForVoiceTeardown } from "@/lib/voice-playback";
 import type { Snapshot, VoiceConfig, Proposal } from "@/lib/types";
 
 export type VoiceMode = "vapi" | "livekit" | "ollama" | "tools";
 
+/** Tabbed testing surface for voice providers and tool endpoints. */
 export default function VoiceLab({ data, refresh, initialMode }: { data: Snapshot; refresh: () => void; initialMode?: VoiceMode }) {
   const active = useRef(false);
+  const operation = useRef(false);
+  const playback = useRef<CallPlayback | null>(null);
+  const [ending, setEnding] = useState(false);
+  const [audioBlocked, setAudioBlocked] = useState(false);
   const connectionId = useRef<string | null>(null);
   const [config, setConfig] = useState<VoiceConfig | null>(null);
   const mode = initialMode || data.location.settings.preferred_voice_provider || "vapi";
@@ -22,8 +30,8 @@ export default function VoiceLab({ data, refresh, initialMode }: { data: Snapsho
   const [service, setService] = useState(data.services[0]?.id || "");
   const [staff, setStaff] = useState("");
   const [selectedItems, setSelectedItems] = useState<string[]>([]);
-  const vapi = useRef<{ stop: () => void } | null>(null); const room = useRef<{ disconnect: () => void } | null>(null); const audioContainer = useRef<HTMLDivElement>(null);
-  useEffect(() => { active.current = true; api<VoiceConfig>(`/voice/config?location_id=${data.location.id}`).then(value => { if (active.current) setConfig(value); }).catch(e => { if (active.current) setError(e.message); }); return () => { active.current = false; vapi.current?.stop(); room.current?.disconnect(); if (testRef.current) fetch(`/api/v1/voice/test-calls/${testRef.current}/end`, { method: "POST", keepalive: true }); }; }, [data.location.id]);
+  const vapi = useRef<VapiClient | null>(null); const room = useRef<{ disconnect: () => void } | null>(null); const audioContainer = useRef<HTMLDivElement>(null);
+  useEffect(() => { active.current = true; api<VoiceConfig>(`/voice/config?location_id=${data.location.id}`).then(value => { if (active.current) setConfig(value); }).catch(e => { if (active.current) setError(e.message); }); return () => { active.current = false; const client = vapi.current; vapi.current = null; playback.current?.dispose(); playback.current = null; if (client) void stopVoiceClient(client).finally(() => client.removeAllListeners()).catch(() => {}); room.current?.disconnect(); if (testRef.current) fetch(`/api/v1/voice/test-calls/${testRef.current}/end`, { method: "POST", keepalive: true }); }; }, [data.location.id]);
   useEffect(() => {
     if (!connected || mode !== "vapi") return;
     let cancelled = false;
@@ -40,19 +48,37 @@ export default function VoiceLab({ data, refresh, initialMode }: { data: Snapsho
         if (!cancelled && active.current && vapi.current === client) {
           setError("Voice connection was interrupted. Reconnect the service and start a new call.");
           log("system", "Call stopped because the business connection was lost.");
-          client?.stop();
-          setConnected(false);
-          refresh();
+          if (client) await endVapi(client);
         }
       } finally { checking = false; }
     }, 15000);
     return () => { cancelled = true; clearInterval(interval); };
   }, [connected, mode, data.location.id]);
   function log(role: string, text: string) { setMessages(m => [...m.slice(-39), { role, text }]); }
+  async function endVapi(client: VapiClient) {
+    if (vapi.current !== client) return;
+    vapi.current = null;
+    operation.current = true;
+    playback.current?.dispose(); playback.current = null;
+    if (active.current) { setEnding(true); setBusy(true); setConnected(false); setAudioBlocked(false); }
+    try {
+      await stopVoiceClient(client);
+      if (active.current) { refresh(); log("system", "Call ended. Verified actions appear in Calls."); }
+    } catch {
+      if (active.current) setError("Call cleanup failed. Reload this page before starting another call.");
+    } finally {
+      client.removeAllListeners();
+      operation.current = false;
+      if (active.current) { setEnding(false); setBusy(false); }
+    }
+  }
   async function startVoice() {
-    setError(""); setBusy(true);
+    if (operation.current || vapi.current) return;
+    operation.current = true;
+    setError(""); setAudioBlocked(false); setMessages([]); setBusy(true);
     try {
       if (mode === "vapi") {
+        await waitForVoiceTeardown();
         const readiness = await mutation<{ connection_id: string }>("/voice/vapi/readiness", { location_id: data.location.id });
         connectionId.current = readiness.connection_id;
         if (!active.current) return;
@@ -60,12 +86,30 @@ export default function VoiceLab({ data, refresh, initialMode }: { data: Snapsho
         if (!active.current) return;
         const client = new Vapi(config!.vapi.public_key);
         vapi.current = client;
-        client.on("call-start", () => { if (!active.current) { void client.stop(); return; } setConnected(true); setBusy(false); log("system", "Vapi web call connected. Your microphone is live."); });
-        client.on("call-end", () => { setConnected(false); setBusy(false); refresh(); log("system", "Call ended. Verified actions appear in Calls."); });
-        client.on("message", message => { if (message.type === "transcript" && message.transcriptType === "final") log(message.role, message.transcript); });
-        client.on("error", error => { setError(error instanceof Error ? error.message : "Vapi call failed. Check assistant and browser permissions."); setBusy(false); setConnected(false); });
-        await client.start(config!.vapi.assistant_id);
-        if (!active.current) await client.stop();
+        const current = () => active.current && vapi.current === client;
+        const speaker = new CallPlayback(value => { if (current()) setAudioBlocked(value); });
+        playback.current = speaker;
+        client.setVolume(1);
+        client.on("audio", player => { if (current()) speaker.attach(player); });
+        client.on("daily-participant-updated", participant => {
+          if (!current() || participant.local || participant.user_name !== "Vapi Speaker") return;
+          const track = participant.tracks.audio.persistentTrack || participant.tracks.audio.track;
+          if (track) speaker.rememberTrack(track);
+        });
+        client.on("call-start", () => { if (current()) { setConnected(true); log("system", "Vapi web call connected. Your microphone is live."); } });
+        client.on("call-end", () => { if (current()) void endVapi(client); });
+        client.on("message", message => { if (current() && message.type === "transcript" && message.transcriptType === "final") log(message.role, message.transcript); });
+        client.on("error", error => {
+          if (!current()) return;
+          const detail = error as { type?: string; error?: { message?: string } };
+          if (detail.type === "audio-start-failed") { setAudioBlocked(true); return; }
+          if (detail.type?.startsWith("audio-processing-") || detail.type === "local-audio-level-observer-error") return;
+          setError(error instanceof Error ? error.message : detail.error?.message || "Vapi call failed. Check assistant and browser permissions.");
+          void endVapi(client);
+        });
+        const started = await startVoiceClient(client, () => client.start(config!.vapi.assistant_id));
+        if (!current()) await stopVoiceClient(client);
+        else if (!started) { setError("The call could not start. Please try again."); await endVapi(client); }
       } else {
         const { Room, RoomEvent, Track } = await import("livekit-client");
         if (!active.current) return;
@@ -79,9 +123,15 @@ export default function VoiceLab({ data, refresh, initialMode }: { data: Snapsho
         await client.startAudio();
         setConnected(true); log("system", "LiveKit room connected. The local agent worker must be running to answer.");
       }
-    } catch (e) { setError((e as Error).message); setConnected(false); } finally { setBusy(false); }
+    } catch (e) { if (active.current) { setError((e as Error).message); setConnected(false); } if (vapi.current) await endVapi(vapi.current); }
+    finally { operation.current = false; if (active.current) setBusy(false); }
   }
-  async function stopVoice() { vapi.current?.stop(); room.current?.disconnect(); setConnected(false); refresh(); }
+  async function stopVoice() {
+    if (vapi.current) { await endVapi(vapi.current); return; }
+    setBusy(true); setEnding(true);
+    try { await room.current?.disconnect(); room.current = null; audioContainer.current?.replaceChildren(); setConnected(false); refresh(); }
+    finally { setBusy(false); setEnding(false); }
+  }
   async function ensureCall() {
     if (testCall) return testCall;
     const call = await mutation<{ id: string }>("/voice/test-calls", { location_id: data.location.id });
@@ -104,7 +154,7 @@ export default function VoiceLab({ data, refresh, initialMode }: { data: Snapsho
   const voiceMode = mode === "vapi" || mode === "livekit";
   const configured = mode === "vapi" ? config?.vapi.configured : config?.livekit.configured;
   return <div className={`voice-session voice-mode-${mode}`}>
-    {voiceMode ? <section className="voice-session-controls"><div><strong>{data.location.name}</strong><p>{mode === "vapi" ? "Vapi" : "LiveKit + Ollama"} · {connected ? "Microphone in use" : "Microphone access required"}</p></div><Button disabled={busy || (!connected && !configured)} onClick={connected ? stopVoice : startVoice}>{busy ? <Loader2 size={15} className="spin" /> : connected ? <PhoneOff size={15} /> : <Mic size={15} />}{busy ? "Connecting…" : connected ? "End call" : "Start call"}</Button>{config && !configured && <p className="voice-session-note">This voice provider requires setup before you can start a call.</p>}<ErrorText error={error} /></section> : <div className="panel voice-controls"><div className="panel-header"><h3>{mode === "tools" ? "Action parameters" : "Message"}</h3></div>{mode === "ollama" ? <LocalTextExperiment data={data} model={config?.ollama.model || "qwen3.5:9b"} refresh={refresh} log={log} /> : <div className="tool-form"><label>Guest name<input value={name} onChange={e => setName(e.target.value)} /></label><label>Date & time ({data.location.timezone})<input value={when} onChange={e => { setWhen(e.target.value); setProposal(null); }} /></label>{data.location.vertical === "restaurant" ? <label>Party size<input type="number" value={party} min={1} max={30} onChange={e => { setParty(Number(e.target.value)); setProposal(null); }} /></label> : <><label>Service<select value={service} onChange={e => setService(e.target.value)}>{data.services.map(s => <option value={s.id} key={s.id}>{s.name}</option>)}</select></label><label>Stylist<select value={staff} onChange={e => setStaff(e.target.value)}><option value="">Any qualified stylist</option>{data.resources.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}</select></label></>}
+    {voiceMode ? <section className="voice-session-controls"><div><strong>{data.location.name}</strong><p>{mode === "vapi" ? "Vapi" : "LiveKit + Ollama"} · {connected ? "Microphone in use" : "Microphone access required"}</p></div><Button disabled={busy || ending || (!connected && !configured)} onClick={connected ? stopVoice : startVoice}>{busy ? <Loader2 size={15} className="spin" /> : connected ? <PhoneOff size={15} /> : <Mic size={15} />}{ending ? "Ending…" : busy ? "Connecting…" : connected ? "End call" : "Start call"}</Button>{audioBlocked && mode === "vapi" && <div className="voice-session-note"><span>Audio playback is paused by your browser.</span><Button variant="outline" size="sm" onClick={() => { void playback.current?.resume(); }}><Volume2 size={15} />Enable audio</Button></div>}{config && !configured && <p className="voice-session-note">This voice provider requires setup before you can start a call.</p>}<ErrorText error={error} /></section> : <div className="panel voice-controls"><div className="panel-header"><h3>{mode === "tools" ? "Action parameters" : "Message"}</h3></div>{mode === "ollama" ? <LocalTextExperiment data={data} model={config?.ollama.model || "qwen3.5:9b"} refresh={refresh} log={log} /> : <div className="tool-form"><label>Guest name<input value={name} onChange={e => setName(e.target.value)} /></label><label>Date & time ({data.location.timezone})<input value={when} onChange={e => { setWhen(e.target.value); setProposal(null); }} /></label>{data.location.vertical === "restaurant" ? <label>Party size<input type="number" value={party} min={1} max={30} onChange={e => { setParty(Number(e.target.value)); setProposal(null); }} /></label> : <><label>Service<select value={service} onChange={e => setService(e.target.value)}>{data.services.map(s => <option value={s.id} key={s.id}>{s.name}</option>)}</select></label><label>Stylist<select value={staff} onChange={e => setStaff(e.target.value)}><option value="">Any qualified stylist</option>{data.resources.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}</select></label></>}
       <div className="tool-buttons"><Button variant="outline" disabled={busy} onClick={() => { try { void run("check_availability", bookingArgs()); } catch (e) { setError((e as Error).message); } }}>Check availability</Button><Button disabled={busy || !name} onClick={prepareBooking}>Prepare booking</Button>{data.location.vertical === "restaurant" && <Button variant="outline" disabled={busy} onClick={() => run("get_wait_estimate", { party_size: party })}>Seating wait</Button>}</div>
       {data.location.vertical === "restaurant" && <div className="tool-cart"><h4>Test takeout</h4>{data.menu.map(item => <label className="checkbox-label" key={item.id}><input type="checkbox" disabled={!item.available} checked={selectedItems.includes(item.id)} onChange={e => setSelectedItems(items => e.target.checked ? [...items, item.id] : items.filter(id => id !== item.id))} />{item.name}{!item.available && " (unavailable)"}</label>)}<Button variant="outline" disabled={busy || !selectedItems.length || !name} onClick={prepareOrder}>Prepare order</Button></div>}
       {proposal && <div className="decision-box"><p>{proposal.readback}</p><Button onClick={confirm} disabled={busy}><Check size={16} /> Confirm action</Button></div>}{testCall && <Button variant="ghost" onClick={endTest} disabled={busy}>End tool test</Button>}

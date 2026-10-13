@@ -1,4 +1,5 @@
 "use client";
+// Staff login screen (credentials or local demo login).
 import { useState } from "react";
 import { ArrowRight, PanelsTopLeft, Loader2 } from "lucide-react";
 import { mutation } from "@/lib/api";

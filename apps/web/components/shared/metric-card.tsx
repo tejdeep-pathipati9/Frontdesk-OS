@@ -1,3 +1,4 @@
+// Small KPI tile with label, value and icon.
 import type { LucideIcon } from "lucide-react";
 
 export function MetricCard({ label, value, detail, icon: Icon }: { label: string; value: string | number; detail?: string; icon: LucideIcon }) {

@@ -1,3 +1,4 @@
+// Next.js config: proxies /api/v1 to FastAPI and sets build options.
 import type { NextConfig } from "next";
 const config: NextConfig = {
   devIndicators: false,

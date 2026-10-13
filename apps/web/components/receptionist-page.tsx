@@ -1,4 +1,5 @@
 "use client";
+// AI receptionist screen: voice provider status, configuration and call history.
 import { useState } from "react";
 import Link from "next/link";
 import { ChevronDown, Phone, Play, Settings2 } from "lucide-react";

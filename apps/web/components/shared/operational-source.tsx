@@ -1,3 +1,4 @@
+// Shows which provider is the source of operational data.
 import Link from "next/link";
 import { Database } from "lucide-react";
 import { time } from "@/lib/api";

@@ -1,4 +1,5 @@
 "use client";
+// Calendar view of restaurant reservations.
 import { useState } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { Button } from "./ui/button";
