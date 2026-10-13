@@ -13,7 +13,7 @@ def test_fresh_sqlite_is_migrated_and_enforces_database_settings(tmp_path):
     engine = make_engine(f"sqlite:///{tmp_path / 'new.db'}")
     migrate_sqlite(engine)
     with engine.connect() as db:
-        assert MigrationContext.configure(db).get_current_revision() == "f42a8b610c34"
+        assert MigrationContext.configure(db).get_current_revision() == "b7194d5c91a0"
         assert db.execute(text("PRAGMA journal_mode")).scalar() == "wal"
         assert db.execute(text("PRAGMA foreign_keys")).scalar() == 1
         assert db.execute(text("PRAGMA integrity_check")).scalar() == "ok"
@@ -31,7 +31,7 @@ def test_existing_unversioned_workspace_is_adopted_without_losing_records(tmp_pa
     reopened = make_engine(f"sqlite:///{tmp_path / 'existing.db'}")
     with reopened.connect() as db:
         assert db.execute(text("SELECT name FROM tenants WHERE id='preserved'")).scalar() == "Existing business"
-        assert MigrationContext.configure(db).get_current_revision() == "f42a8b610c34"
+        assert MigrationContext.configure(db).get_current_revision() == "b7194d5c91a0"
     reopened.dispose()
 
 

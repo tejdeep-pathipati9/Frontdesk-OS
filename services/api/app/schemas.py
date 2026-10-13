@@ -105,6 +105,7 @@ class LocationCreate(StrictModel):
 
 
 class SettingsPatch(StrictModel):
+    transcript_retention_calls: int | None = Field(default=None, ge=0, le=10)
     intake_paused: bool | None = None
     turn_minutes: int | None = Field(default=None, ge=15, le=240)
     cleaning_minutes: int | None = Field(default=None, ge=0, le=60)

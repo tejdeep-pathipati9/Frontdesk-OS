@@ -166,6 +166,7 @@ class Call(Owned, Base):
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     consent: Mapped[bool] = mapped_column(Boolean, default=False)
     transcript: Mapped[list] = mapped_column(JSON, default=list)
+    transcript_status: Mapped[str] = mapped_column(String(20), default="disabled", server_default="disabled")
     summary: Mapped[str] = mapped_column(String(500), default="")
 
 

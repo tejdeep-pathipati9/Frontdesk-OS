@@ -94,7 +94,7 @@ async def entrypoint(ctx: agents.JobContext):
     ctx.add_shutdown_callback(shutdown)
     await ctx.connect()
     await session.start(room=ctx.room, agent=Agent(instructions=contract["prompt"], tools=make_tools(client, contract["tools"])))
-    await session.generate_reply(instructions="Introduce yourself as the business's automated assistant. Use get_business_info to check business context before answering questions.")
+    await session.generate_reply(instructions="Introduce yourself as the business's automated assistant. " + contract.get('transcript_notice', '') + " Use get_business_info to check business context before answering questions.")
 
 
 if __name__ == "__main__":

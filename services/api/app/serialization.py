@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy import inspect, select
 from .domain import utc
-from .models import Customer, Allocation, Resource, OperationalProjection
+from .models import Customer, Allocation, Resource, OperationalProjection, Call
 
 
 def serialize(record):
@@ -9,6 +9,8 @@ def serialize(record):
     for column in inspect(record).mapper.column_attrs:
         value = getattr(record, column.key)
         result[column.key] = utc(value).isoformat() if isinstance(value, datetime) else value
+    if isinstance(record, Call):
+        result['transcript_count'] = len(record.transcript or [])
     return result
 
 

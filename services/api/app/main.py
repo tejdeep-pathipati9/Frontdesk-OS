@@ -22,6 +22,7 @@ from .serialization import serialize, booking_dict
 from .seed import seed, DEMO_TENANT, RESTAURANT, SALON
 from .providers import SquareAdapter, ToastAdapter
 from .tools import execute_tool, TOOLS, AGENT_PROMPT
+from .transcripts import start_retention, prune as prune_transcripts, retention_limit
 from .integration_normalization import Envelope as MockIntegrationEvent
 
 
@@ -193,8 +194,11 @@ def patch_settings(location_id: str, body: s.SettingsPatch, user=Depends(identit
         if any(len(group) < 2 or len(set(group)) != len(group) or any(id_ not in valid_ids for id_ in group) for group in updated.get("combinations", [])):
             raise DomainError("INVALID_COMBINATION", "Table combinations must contain distinct tables at this location", 422)
         loc.settings = updated
+        if body.transcript_retention_calls is not None:
+            prune_transcripts(db, loc)
         emit(db, loc, "settings.updated", body.model_dump(exclude_none=True), user["id"])
         return serialize(loc)
+
 
 
 
@@ -576,9 +580,18 @@ def call_detail(id_: str, user=Depends(identity)):
         row = owned(db, Call, id_, user)
         result = serialize(row)
         result["tools"] = [serialize(t) for t in db.scalars(select(ToolExecution).where(ToolExecution.call_id == row.id, ToolExecution.tenant_id == row.tenant_id).order_by(ToolExecution.created_at))]
-        result["reservations"] = [booking_dict(db, r) for r in db.scalars(select(Reservation).where(Reservation.call_id == row.id, Reservation.tenant_id == row.tenant_id))]
-        result["orders"] = [serialize(r) for r in db.scalars(select(Order).where(Order.call_id == row.id, Order.tenant_id == row.tenant_id))]
+        actions = list(db.scalars(select(PendingAction).where(PendingAction.call_id == row.id, PendingAction.tenant_id == row.tenant_id, PendingAction.location_id == row.location_id).order_by(PendingAction.created_at)))
+        linked_ids = [a.result['id'] for a in actions if a.result and a.result.get('id')]
+        result["reservations"] = [booking_dict(db, r) for r in db.scalars(select(Reservation).where(Reservation.tenant_id == row.tenant_id, Reservation.location_id == row.location_id, (Reservation.call_id == row.id) | Reservation.id.in_(linked_ids)))]
+        result["orders"] = [serialize(r) for r in db.scalars(select(Order).where(Order.tenant_id == row.tenant_id, Order.location_id == row.location_id, (Order.call_id == row.id) | Order.id.in_(linked_ids)))]
+        result['actions'] = [{'id': a.id, 'kind': a.kind, 'state': a.state, 'created_at': utc(a.created_at).isoformat(), 'confirmed_at': utc(a.confirmed_at).isoformat() if a.confirmed_at else None, 'result': a.result} for a in actions]
+        events = list(db.scalars(select(Event).where(Event.tenant_id == row.tenant_id, Event.location_id == row.location_id, Event.payload['call_id'].as_string() == row.id).order_by(Event.created_at)))
+        result['events'] = [serialize(e) for e in events]
+        targets = [f'action:{a.id}' for a in actions] + [f'event:{e.id}' for e in events] + [f"tool:{t['id']}" for t in result['tools']]
+        result['reviews'] = [serialize(r) for r in db.scalars(select(AuditEvent).where(AuditEvent.tenant_id == row.tenant_id, AuditEvent.location_id == row.location_id, AuditEvent.action == 'attention.reviewed', AuditEvent.target_id.in_(targets)).order_by(AuditEvent.created_at))]
+        result['transcript_retention_calls'] = retention_limit(db.get(Location, row.location_id))
         return result
+
 
 
 @app.get("/api/v1/audit-events")
@@ -650,7 +663,8 @@ def voice_config(location_id: str, user=Depends(identity)):
     cfg = settings()
     assistant = cfg.vapi_restaurant_assistant_id if loc.vertical == "restaurant" else cfg.vapi_salon_assistant_id
     allowed = user["tenant_id"] == DEMO_TENANT and location_id in [RESTAURANT, SALON]
-    return {"preferred_provider": loc.settings.get("preferred_voice_provider", "vapi"), "vapi": {"configured": allowed and bool(cfg.vapi_public_key and assistant and cfg.vapi_webhook_secret), "public_key": cfg.vapi_public_key if allowed else "", "assistant_id": assistant if allowed else "", "purpose": "Primary phone and web demo"}, "livekit": {"configured": allowed and bool(cfg.livekit_url and cfg.livekit_api_key and cfg.livekit_api_secret and cfg.agent_api_token), "purpose": "Additional local prototype"}, "ollama": {"model": cfg.ollama_model}, "recordings_retained": False, "transcripts_retained": False, "tools": TOOLS, "prompt": AGENT_PROMPT}
+    return {"preferred_provider": loc.settings.get("preferred_voice_provider", "vapi"), "vapi": {"configured": allowed and bool(cfg.vapi_public_key and assistant and cfg.vapi_webhook_secret), "public_key": cfg.vapi_public_key if allowed else "", "assistant_id": assistant if allowed else "", "purpose": "Phone and web calls"}, "livekit": {"configured": allowed and bool(cfg.livekit_url and cfg.livekit_api_key and cfg.livekit_api_secret and cfg.agent_api_token), "purpose": "Self-hosted voice"}, "ollama": {"model": cfg.ollama_model}, "recordings_retained": False, "transcripts_retained": bool(retention_limit(loc)), "transcript_retention_calls": retention_limit(loc), "tools": TOOLS, "prompt": AGENT_PROMPT}
+
 
 
 @app.post("/api/v1/voice/test-calls")
@@ -708,6 +722,8 @@ def end_call(db, call):
         call.summary = f"{last.kind.replace('_', ' ').capitalize()} {last.result.get('status', 'completed').replace('_', ' ')}. Reference {last.result.get('reference', '')}."
     else:
         call.summary = {'failed': 'Request not completed. Staff review required.', 'escalated': 'Staff assistance requested.', 'information_only': 'Information provided. No booking or order created.'}.get(call.outcome, 'Call ended.')
+    prune_transcripts(db, db.get(Location, call.location_id))
+
 
 
 
@@ -776,6 +792,7 @@ def vapi_webhook(body: dict, request: Request):
             call = Call(tenant_id=loc.tenant_id, location_id=loc.id, provider="vapi", provider_call_id=provider_call["id"], caller_masked=f"•••• {number[-4:]}" if number else "Vapi web call")
             db.add(call)
             db.flush()
+            start_retention(db, call, loc)
         type_ = message.get("type", "unknown")
         source_id = message.get("id") or hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest()
         source_id = f"{call.provider_call_id}:{source_id}"
@@ -808,6 +825,7 @@ def vapi_webhook(body: dict, request: Request):
             end_call(db, call)
         db.add(Event(tenant_id=loc.tenant_id, location_id=loc.id, source="vapi", source_event_id=source_id, type=f"call.{type_}", payload={"call_id": call.id, "status": call.status}))
         return {"status": "processed"}
+
 
 
 
@@ -845,10 +863,12 @@ def livekit_session(body: s.VoiceSession, user=Depends(identity)):
         call = Call(tenant_id=loc.tenant_id, location_id=loc.id, provider="livekit", provider_call_id=room_name, caller_masked="LiveKit web call")
         db.add(call)
         db.flush()
+        start_retention(db, call, loc)
         metadata = json.dumps({"call_id": call.id})
         token = (AccessToken(cfg.livekit_api_key, cfg.livekit_api_secret).with_identity(f"guest-{uid()}").with_ttl(timedelta(minutes=10)).with_grants(VideoGrants(room_join=True, room=room_name, can_publish=True, can_subscribe=True, can_publish_data=False)).with_room_config(RoomConfiguration(agents=[RoomAgentDispatch(agent_name="frontdesk-local", metadata=metadata)])).to_jwt())
         emit(db, loc, "call.livekit_session_created", {"call_id": call.id}, user["id"], call.id)
         return {"token": token, "url": cfg.livekit_url, "call_id": call.id}
+
 
 
 def agent_call(db, id_, request):
@@ -865,7 +885,9 @@ def agent_call(db, id_, request):
 def read_agent_call(id_: str, request: Request):
     with Session() as db:
         call = agent_call(db, id_, request)
-        return {"call_id": call.id, "status": call.status, "location_id": call.location_id, "prompt": AGENT_PROMPT, "tools": TOOLS}
+        notice = "This call is transcribed for service review. You can ask me not to save the transcript." if call.transcript_status == 'retained' else ""
+        return {"call_id": call.id, "status": call.status, "location_id": call.location_id, "prompt": AGENT_PROMPT, "transcript_notice": notice, "tools": TOOLS}
+
 
 
 @app.post("/api/v1/voice/agent/calls/{id_}/tools")
@@ -888,12 +910,15 @@ def agent_transcript(id_: str, body: s.TranscriptEvent, request: Request):
         if db.scalar(select(Event.id).where(Event.source == "livekit", Event.source_event_id == key)):
             return {"status": "already_processed"}
         if body.interrupted:
+            from .transcripts import capture
+            capture(db, call, body.role, body.text, interrupted=True)
             for action in db.scalars(select(PendingAction).where(PendingAction.call_id == call.id, PendingAction.state == "awaiting_confirmation")):
                 interrupt_readback(action)
         else:
             observe_transcript(db, call, body.role, body.text)
         db.add(Event(tenant_id=call.tenant_id, location_id=call.location_id, source="livekit", source_event_id=key, type="call.transcript_processed", payload={"call_id": call.id, "role": body.role, "interrupted": body.interrupted}))
         return {"status": "processed"}
+
 
 
 

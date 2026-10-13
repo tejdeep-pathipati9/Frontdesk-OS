@@ -397,6 +397,8 @@ def observe_transcript(db, call, role, text):
     unfamiliar replies can be interpreted outside this transaction at commit time.
     Speech stays transient when retention is off; sanitized decision metadata persists.
     """
+    from .transcripts import capture
+    capture(db, call, role, text)
     if call.status != "in_progress":
         return
     action = db.scalar(select(PendingAction).where(PendingAction.call_id == call.id, PendingAction.state == "awaiting_confirmation").order_by(PendingAction.created_at.desc()))
