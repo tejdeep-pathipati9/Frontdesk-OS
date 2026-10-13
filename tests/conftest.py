@@ -12,7 +12,10 @@ from app.config import settings
 
 
 @pytest.fixture
-def database(tmp_path):
+def database(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings(), "ollama_confirmation_enabled", False)
+    from app.confirmation_intent import clear
+    clear()
     engine = storage.make_engine(f"sqlite:///{tmp_path / 'test.db'}")
     Base.metadata.create_all(engine)
     factory = sessionmaker(engine, expire_on_commit=False)
@@ -20,6 +23,7 @@ def database(tmp_path):
         seed(session)
     yield factory
     engine.dispose()
+    clear()
 
 
 @pytest.fixture

@@ -58,6 +58,9 @@ def run_chat(call_id, text, factory=Session):
                 return {"text": content or "Please try asking a specific business question.", "tool_results": tool_results, "provider": "ollama_text", "model": settings().ollama_model}
             for index, requested in enumerate(message["tool_calls"][:8]):
                 function = requested.get("function", {})
+                if function.get("name") == "commit_action":
+                    from .confirmation_intent import resolve
+                    resolve(call_id, factory)
                 with transaction(factory) as db:
                     call = db.get(Call, call_id)
                     result = execute_tool(db, call, function.get("name", ""), function.get("arguments", {}), requested.get("id") or f"ollama-{len(chat.messages)}-{index}")

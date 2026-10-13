@@ -262,6 +262,11 @@ def quote(db, loc, request):
 
 
 def prepare(db, loc, request, call_id=None):
+    from .phone import normalize_phone
+    try:
+        request = request.model_copy(update={"phone": normalize_phone(request.phone, loc.settings.get("phone_country_code"))})
+    except ValueError as error:
+        raise DomainError("PHONE_FORMAT_REQUIRED", str(error), 422) from error
     # Live adapters are exposed separately; never silently make an internal booking
     # for a location configured to use an external authoritative provider.
     provider_key = "order_provider" if request.kind == "order" else "booking_provider"
@@ -321,6 +326,8 @@ def prepare(db, loc, request, call_id=None):
     # Supersede earlier proposals; an affirmative always applies to just this proposal.
     if call_id:
         for old in db.scalars(select(PendingAction).where(PendingAction.call_id == call_id, PendingAction.id != action.id, PendingAction.state == "awaiting_confirmation")):
+            from .confirmation_intent import discard
+            discard(old)
             old.state = "superseded"
     emit(db, loc, "action.prepared", {"action_id": action.id, "kind": action.kind}, target=action.id)
     return {"action_id": action.id, "status": action.state, "readback": action.readback, "next_action": "Read readback once, then commit_action after the caller agrees. Do not prepare again unless details change.", "expires_at": action.expires_at.isoformat(), "decision": decision}
@@ -330,28 +337,97 @@ def normalize(text):
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
+def speech_key(text):
+    """Tolerate transcription of numbers, never changes to the proposal's terms."""
+    text = text.lower()
+    cardinals = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split()
+    ordinals = "zeroth first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth thirteenth fourteenth fifteenth sixteenth seventeenth eighteenth nineteenth twentieth".split()
+    replacements = {word: str(i) for words in [cardinals, ordinals] for i, word in enumerate(words)}
+    for tens, value in [("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50)]:
+        replacements[tens] = str(value)
+        for unit in range(1, 10):
+            replacements[f"{tens} {cardinals[unit]}"] = str(value + unit)
+            replacements[f"{tens} {ordinals[unit]}"] = str(value + unit)
+    pattern = r"\b(?:" + "|".join(re.escape(word).replace(r"\ ", r"[\s-]+") for word in sorted(replacements, key=len, reverse=True)) + r")\b"
+    text = re.sub(pattern, lambda m: replacements[re.sub(r"[\s-]+", " ", m[0])], text)
+    text = re.sub(r"\b(\d+)(?:st|nd|rd|th)\b", r"\1", text)
+    text = re.sub(r"\b(\d{1,2}):00\s*(?=[ap][.\s]*m\b)", r"\1 ", text)
+    text = re.sub(r"\b0+(\d+)", r"\1", text)
+    return normalize(text)
+
+
+def explicit_agreement(text, kind=None):
+    # A closed grammar accepts natural/repeated agreement, never arbitrary speech
+    # containing "yes", corrections, conditions, or questions.
+    if "?" in text:
+        return False
+    clauses = ["yes", "yeah", "yep", "yesplease", "yesconfirm", "correct", "right", "confirm", "confirmed", "thatiscorrect", "thatscorrect", "thatisright", "thatsright", "soundsright", "soundsgood", "okay", "ok", "sure", "iwanttobook", "iwanttobookit", "iwannabook", "iwannabookit", "bookit", "pleasebookit", "goahead", "goaheadandbookit", "proceed", "pleaseproceed", "proceedwiththat"]
+    commands = {"reservation": ["bookthetable", "bookthereservation", "confirmthereservation"], "appointment": ["booktheappointment", "confirmtheappointment"], "order": ["placetheorder", "pleaseplacetheorder", "confirmtheorder"]}
+    clauses += commands.get(kind, []) if kind else [phrase for phrases in commands.values() for phrase in phrases]
+    return re.fullmatch("(?:" + "|".join(clauses) + ")+", normalize(text)) is not None
+
+
+def confirmation_help(text):
+    return normalize(text) in {"howdoiconfirm", "howshouldiconfirm", "whatshouldisay", "whatdoisay", "doiconfirmyes", "anddoiconfirmyes", "doijustsayyes", "howmanytimesmusticonfirm"}
+
+
+def reset_readback(action):
+    from .confirmation_intent import discard
+    discard(action)
+    action.readback_at, action.confirmed_at = None, None
+    action.payload = {**action.payload, "readback_progress": 0, "readback_states": [], "confirmation": {}}
+
+
+def interrupt_readback(action):
+    # A caller can barge in with "yes" after the full readback. An interruption
+    # alone is never consent, and incomplete readbacks must start over.
+    if action.readback_at:
+        from .confirmation_intent import record
+        action.confirmed_at = None
+        record(action, "unclear", "interrupted")
+    else:
+        reset_readback(action)
+
+
 def observe_transcript(db, call, role, text):
     """Use authenticated provider final transcripts, never a tool's confirmed flag.
 
-    Require the entire prepared readback to occur in an assistant final transcript,
-    followed by an unambiguous affirmative user turn. Transcripts are processed
-    transiently when consent is disabled; only the decision timestamps persist.
+    Require the entire prepared readback across consecutive assistant final segments,
+    followed by an unambiguous agreement turn. Clear replies take a fast path;
+    unfamiliar replies can be interpreted outside this transaction at commit time.
+    Speech stays transient when retention is off; sanitized decision metadata persists.
     """
     if call.status != "in_progress":
         return
     action = db.scalar(select(PendingAction).where(PendingAction.call_id == call.id, PendingAction.state == "awaiting_confirmation").order_by(PendingAction.created_at.desc()))
     if not action or utc(action.expires_at) <= now():
         return
-    if role == "assistant" and normalize(action.readback) in normalize(text):
-        action.readback_at = now()
-    elif role == "user" and action.readback_at:
-        if re.fullmatch(r"(yes|yes please|yes confirm|yes that is correct|correct|confirm|confirmed|please book it|please place the order)[.! ]*", text.lower().strip()):
+    if role == "assistant" and not action.readback_at:
+        from .speech_confirmation import match_segment
+        if match_segment(action, text, speech_key):
+            action.readback_at = now()
+    elif role == "user":
+        from .confirmation_intent import record, stage, veto
+        from .config import settings
+        action.confirmed_at = None
+        if not action.readback_at:
+            reset_readback(action)
+            record(action, "readback_incomplete", "policy")
+        elif explicit_agreement(text, action.kind) and veto(text, action.kind) is None:
             action.confirmed_at = now()
+            record(action, "confirm", "fast_path")
+        elif confirmation_help(text):
+            record(action, "question", "policy")
         else:
-            action.readback_at = None
-            action.confirmed_at = None
-    if call.consent:
-        call.transcript = [*call.transcript, {"role": role, "text": text[:2000], "at": now().isoformat()}]
+            blocked = veto(text, action.kind)
+            if blocked in ["change", "reject"]:
+                reset_readback(action)
+            if blocked:
+                record(action, blocked, "policy_veto")
+            elif settings().ollama_confirmation_enabled:
+                stage(action, text)
+            else:
+                record(action, "unclear", "model_disabled")
 
 
 def confirm_staff(db, action):
@@ -447,9 +523,17 @@ def commit(db, loc, action):
 
 
 def lookup_order(db, loc, reference, phone):
-    matches = list(db.scalars(select(Order).join(Customer).where(Order.tenant_id == loc.tenant_id, Order.location_id == loc.id, Order.id.like(reference.lower() + "%"), Customer.phone == phone, Customer.tenant_id == loc.tenant_id)))
+    from sqlalchemy import or_
+    from .phone import normalize_phone
+    try:
+        phone = normalize_phone(phone, loc.settings.get("phone_country_code"))
+    except ValueError as error:
+        raise DomainError("PHONE_FORMAT_REQUIRED", str(error), 422) from error
+    matches = list(db.scalars(select(Order).join(Customer).where(Order.tenant_id == loc.tenant_id, Order.location_id == loc.id, or_(Order.id.like(reference.lower() + "%"), Order.external_id == reference), Customer.phone == phone, Customer.tenant_id == loc.tenant_id)))
     if len(matches) != 1:
         raise DomainError("VERIFICATION_FAILED", "Order reference or phone could not be verified", 404)
     row = matches[0]
-    return {"status": row.state, "reference": row.id[:8].upper(), "pickup_min": utc(row.pickup_min).isoformat(), "pickup_max": utc(row.pickup_max).isoformat(), "provider": row.provider, "mode": loc.mode}
-
+    if row.provider != "internal":
+        from .integration_service import require_adapter
+        require_adapter(db, loc, row.provider, "orders_read")
+    return {"status": row.state, "reference": row.external_id or row.id[:8].upper(), "pickup_min": utc(row.pickup_min).isoformat(), "pickup_max": utc(row.pickup_max).isoformat(), "provider": row.provider, "mode": loc.mode}

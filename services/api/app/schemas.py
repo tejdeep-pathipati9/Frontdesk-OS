@@ -43,13 +43,18 @@ class PrepareAction(StrictModel):
     location_id: str
     kind: Literal["reservation", "appointment", "order", "cancel_booking", "reschedule_booking"]
     name: str = Field(min_length=1, max_length=100)
-    phone: str = Field(default="", max_length=30, pattern=r"^(\+[1-9]\d{7,14})?$")
+    phone: str = Field(default="", max_length=80, pattern=r"^[+\d\s().-]*$")
     start_at: datetime | None = None
     party_size: int = Field(default=2, ge=1, le=30)
     service_id: str | None = None
     staff_id: str | None = None
     items: list[CartItem] = Field(default_factory=list, max_length=30)
     booking_reference: str | None = Field(default=None, min_length=8, max_length=64, pattern=r"^[A-Za-z0-9-]+$")
+
+    @field_validator("phone", mode="before")
+    @classmethod
+    def optional_phone(cls, value):
+        return "" if value is None else value
 
     @field_validator("start_at")
     @classmethod
@@ -185,7 +190,7 @@ class ChatTurn(StrictModel):
 
 class LookupRequest(StrictModel):
     reference: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9-]+$")
-    phone: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
+    phone: str = Field(min_length=1, max_length=80, pattern=r"^[+\d\s().-]+$")
 
 
 class AttentionDecision(StrictModel):

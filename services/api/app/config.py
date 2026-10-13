@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +23,9 @@ class Settings(BaseSettings):
     agent_api_token: str = ""
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3.5:9b"
+    ollama_confirmation_enabled: bool = False
+    ollama_confirmation_model: str = "qwen3.5:9b"
+    ollama_confirmation_timeout: float = Field(default=3, gt=0, le=10)
     square_access_token: str = ""
     square_location_id: str = ""
     square_environment: str = "sandbox"

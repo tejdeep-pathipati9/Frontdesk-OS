@@ -17,7 +17,7 @@ from .db import Session, transaction, init_db
 from .models import *
 from . import schemas as s
 from .auth import identity, require_role, secret_matches, token_for
-from .domain import DomainError, availability, seating_wait, quote, prepare, commit, confirm_staff, observe_transcript, emit, utc, conflict, business_open
+from .domain import DomainError, availability, seating_wait, quote, prepare, commit, confirm_staff, observe_transcript, interrupt_readback, emit, utc, conflict, business_open
 from .serialization import serialize, booking_dict
 from .seed import seed, DEMO_TENANT, RESTAURANT, SALON
 from .providers import SquareAdapter, ToastAdapter
@@ -688,10 +688,27 @@ def confirm_test_call(id_: str, body: s.CommitAction, user=Depends(identity)):
 
 def end_call(db, call):
     call.status, call.ended_at = "ended", now()
-    if call.outcome == "pending":
-        call.outcome = "information_only"
-    for action in db.scalars(select(PendingAction).where(PendingAction.call_id == call.id, PendingAction.state == "awaiting_confirmation")):
-        action.state = "abandoned"
+    actions = list(db.scalars(select(PendingAction).where(PendingAction.call_id == call.id, PendingAction.tenant_id == call.tenant_id)))
+    uncertain = any(a.state == 'pending_confirmation' for a in actions)
+    if uncertain:
+        call.outcome = 'pending'
+    elif call.outcome == "pending":
+        failed = db.scalar(select(ToolExecution.id).where(ToolExecution.call_id == call.id, ToolExecution.status == 'failed', ToolExecution.name.in_(['prepare_action', 'commit_action'])))
+        call.outcome = "failed" if failed else "information_only"
+    for action in actions:
+        if action.state == 'awaiting_confirmation':
+            from .confirmation_intent import discard
+            discard(action)
+            action.state = 'abandoned'
+    completed = [a for a in actions if a.state == 'committed']
+    if uncertain:
+        call.summary = 'Awaiting provider confirmation. Staff review required.'
+    elif completed:
+        last = completed[-1]
+        call.summary = f"{last.kind.replace('_', ' ').capitalize()} {last.result.get('status', 'completed').replace('_', ' ')}. Reference {last.result.get('reference', '')}."
+    else:
+        call.summary = {'failed': 'Request not completed. Staff review required.', 'escalated': 'Staff assistance requested.', 'information_only': 'Information provided. No booking or order created.'}.get(call.outcome, 'Call ended.')
+
 
 
 @app.post("/api/v1/voice/test-calls/{id_}/end")
@@ -716,6 +733,39 @@ def vapi_webhook(body: dict, request: Request):
     mapping = {id_: loc for id_, loc in [(cfg.vapi_restaurant_assistant_id, RESTAURANT), (cfg.vapi_salon_assistant_id, SALON)] if id_}
     if assistant not in mapping or not provider_call.get("id"):
         raise DomainError("UNKNOWN_ASSISTANT", "Assistant is not mapped to an authorized location", 403)
+    if message.get("type") == "tool-calls":
+        # Transcript webhooks and tool requests can arrive out of order. Give a
+        # delayed final transcript a short chance to arrive, WITHOUT holding the
+        # SQLite writer lock that its handler needs. No model-supplied consent.
+        deadline = time.monotonic() + 1.5
+        for item in message.get("toolCallList", []):
+            function = item.get("function", {})
+            if function.get("name") != "commit_action":
+                continue
+            args = function.get("arguments", {})
+            try:
+                args = json.loads(args) if isinstance(args, str) else args
+                action_id = args.get("action_id") if isinstance(args, dict) else None
+            except ValueError:
+                continue
+            if not action_id:
+                continue
+            while True:
+                with Session() as db:
+                    action = db.scalar(select(PendingAction).join(Call, PendingAction.call_id == Call.id).where(PendingAction.id == action_id, PendingAction.location_id == mapping[assistant], Call.provider == "vapi", Call.provider_call_id == provider_call["id"]))
+                    waiting = bool(action and action.state == "awaiting_confirmation" and not action.confirmed_at and utc(action.expires_at) > now() and action.payload.get("confirmation", {}).get("intent") not in ["interpreting", "change", "reject", "question", "unclear"])
+                if not waiting or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+        # Interpret the authenticated final user turn outside the SQLite lock.
+        # The resolver rechecks call/action/readback/turn identity before applying.
+        if any(item.get("function", {}).get("name") == "commit_action" for item in message.get("toolCallList", [])):
+            with Session() as db:
+                authorized_call = db.scalar(select(Call).where(Call.provider == "vapi", Call.provider_call_id == provider_call["id"], Call.location_id == mapping[assistant]))
+                call_id = authorized_call.id if authorized_call else None
+            if call_id:
+                from .confirmation_intent import resolve
+                resolve(call_id, Session)
     with transaction() as db:
         loc = db.get(Location, mapping[assistant])
         if not loc:
@@ -749,13 +799,16 @@ def vapi_webhook(body: dict, request: Request):
             return {"results": results}
         if replayed:
             return {"status": "already_processed"}
-        if type_ == "transcript" and message.get("transcriptType") == "final":
+        if type_ == "user-interrupted":
+            for action in db.scalars(select(PendingAction).where(PendingAction.call_id == call.id, PendingAction.tenant_id == loc.tenant_id, PendingAction.state == "awaiting_confirmation")):
+                interrupt_readback(action)
+        if (type_ == "transcript" and message.get("transcriptType") == "final") or type_ == 'transcript[transcriptType="final"]':
             observe_transcript(db, call, message.get("role", ""), message.get("transcript", ""))
         if type_ == "end-of-call-report" or (type_ == "status-update" and message.get("status") == "ended"):
             end_call(db, call)
-            call.summary = "Call ended. See tool timeline for verified action outcomes."
         db.add(Event(tenant_id=loc.tenant_id, location_id=loc.id, source="vapi", source_event_id=source_id, type=f"call.{type_}", payload={"call_id": call.id, "status": call.status}))
         return {"status": "processed"}
+
 
 
 @app.get("/api/v1/realtime")
@@ -817,8 +870,14 @@ def read_agent_call(id_: str, request: Request):
 
 @app.post("/api/v1/voice/agent/calls/{id_}/tools")
 def agent_tool(id_: str, body: s.ToolRequest, request: Request):
+    if body.name == "commit_action":
+        with Session() as db:
+            agent_call(db, id_, request)
+        from .confirmation_intent import resolve
+        resolve(id_, Session)
     with transaction() as db:
         return execute_tool(db, agent_call(db, id_, request), body.name, body.arguments, body.request_id)
+
 
 
 @app.post("/api/v1/voice/agent/calls/{id_}/transcript")
@@ -830,11 +889,12 @@ def agent_transcript(id_: str, body: s.TranscriptEvent, request: Request):
             return {"status": "already_processed"}
         if body.interrupted:
             for action in db.scalars(select(PendingAction).where(PendingAction.call_id == call.id, PendingAction.state == "awaiting_confirmation")):
-                action.readback_at, action.confirmed_at = None, None
+                interrupt_readback(action)
         else:
             observe_transcript(db, call, body.role, body.text)
         db.add(Event(tenant_id=call.tenant_id, location_id=call.location_id, source="livekit", source_event_id=key, type="call.transcript_processed", payload={"call_id": call.id, "role": body.role, "interrupted": body.interrupted}))
         return {"status": "processed"}
+
 
 
 @app.post("/api/v1/voice/agent/calls/{id_}/end")
