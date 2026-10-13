@@ -3,14 +3,15 @@ import math
 import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from .models import Resource, Reservation, Allocation, Service, MenuItem, KitchenState, Order, Customer, PendingAction, WaitlistEntry, Event, AuditEvent, Call, now
 from .schemas import Availability, PrepareAction, QuoteRequest
 
 
 class DomainError(Exception):
-    def __init__(self, code, message, status=409, retryable=False):
+    def __init__(self, code, message, status=409, retryable=False, decision=None):
         self.code, self.message, self.status, self.retryable = code, message, status, retryable
+        self.decision = decision
         super().__init__(message)
 
 
@@ -27,13 +28,17 @@ def emit(db, loc, type_, payload=None, actor="system", target=""):
 
 
 def resources(db, loc):
-    return list(db.scalars(select(Resource).where(Resource.tenant_id == loc.tenant_id, Resource.location_id == loc.id).order_by(Resource.name)))
+    rows = list(db.scalars(select(Resource).where(Resource.tenant_id == loc.tenant_id, Resource.location_id == loc.id).order_by(Resource.name)))
+    provider = loc.settings.get("floor_provider")
+    return [r for r in rows if r.kind != "table" or (r.attributes.get("source_provider") == provider if provider else not r.attributes.get("source_provider"))]
 
 
 def business_open(loc, start, end):
     zone = ZoneInfo(loc.timezone)
     local_start, local_end = utc(start).astimezone(zone), utc(end).astimezone(zone)
     opening, closing = loc.settings.get("open_hour", 9), loc.settings.get("close_hour", 22)
+    if opening == 0 and closing == 24:
+        return local_end > local_start  # Continuous 24-hour service spans midnight.
     midnight = local_start.replace(hour=0, minute=0, second=0, microsecond=0)
     close_at = midnight + timedelta(hours=closing)
     return local_start >= midnight + timedelta(hours=opening) and local_end <= close_at
@@ -66,10 +71,18 @@ def table_sets(db, loc, party):
     return sorted(candidates, key=lambda rs: (sum(r.capacity for r in rs), len(rs), tuple(r.id for r in rs)))
 
 
-def release_window(loc, resource):
-    if resource.state in ["out_of_service", "held"]:
-        return None
+def table_needs_verification(loc, resource):
     if not freshness(loc, resource.verified_at):
+        return True
+    # A newer open POS check conflicts with an earlier staff-free observation.
+    # It requests verification; it does not establish occupied or free status.
+    if resource.state == "available" and resource.attributes.get("pos_signal") == "check_open" and resource.attributes.get("signal_observed_at") and utc(resource.attributes["signal_observed_at"]) > utc(resource.verified_at):
+        return True
+    return False
+
+
+def release_window(loc, resource):
+    if resource.state in ["out_of_service", "held"] or table_needs_verification(loc, resource):
         return None
     current = now()
     if resource.state == "available":
@@ -129,7 +142,7 @@ def slot(db, loc, query, exclude=None):
     return None, end, "STALE_STATE" if unknown else "NO_COMPATIBLE_RESOURCE"
 
 
-def availability(db, loc, query, exclude=None, alternatives=True):
+def availability(db, loc, query, exclude=None, alternatives=True, force_internal=False):
     start = utc(query.start_at)
     if start < now() - timedelta(seconds=30):
         raise DomainError("PAST_TIME", "Choose a future time", 422)
@@ -138,6 +151,9 @@ def availability(db, loc, query, exclude=None, alternatives=True):
     evidence = {"sources": ["manual_floor" if loc.vertical == "restaurant" else "staff_schedule", "internal_reservations"], "as_of": now().isoformat(), "confidence": "medium", "mode": loc.mode}
     if loc.settings.get("intake_paused"):
         return {"status": "NO_CAPACITY", "reason_codes": ["INTAKE_PAUSED"], "alternatives": [], "evidence": evidence, "permitted_actions": ["request_staff_callback"]}
+    if loc.vertical == "restaurant" and loc.settings.get("booking_provider", "internal") != "internal" and not force_internal:
+        from .integration_service import provider_availability
+        return provider_availability(db, loc, query, exclude)
     group, end, reason = slot(db, loc, query, exclude)
     if group:
         return {"status": "AVAILABLE", "start_at": start.isoformat(), "end_at": end.isoformat(), "resource_ids": [r.id for r in group], "resources": [r.name for r in group], "reason_codes": [], "alternatives": [], "evidence": evidence, "permitted_actions": ["prepare_action"]}
@@ -150,7 +166,8 @@ def availability(db, loc, query, exclude=None, alternatives=True):
                 options.append({"start_at": candidate.start_at.isoformat(), "end_at": candidate_end.isoformat(), "resources": [r.name for r in found]})
             if len(options) == 3:
                 break
-    return {"status": "UNKNOWN" if reason == "STALE_STATE" else "NO_CAPACITY", "reason_codes": [reason], "alternatives": options, "evidence": {**evidence, "confidence": "low"}, "permitted_actions": ["offer_alternative", "join_waitlist", "request_staff_callback"]}
+    needs_arrangement = loc.vertical == "restaurant" and query.party_size > 8 and reason == "NO_COMPATIBLE_RESOURCE"
+    return {"status": "UNKNOWN" if reason == "STALE_STATE" or needs_arrangement else "NO_CAPACITY", "reason_codes": ["STAFF_ARRANGEMENT_REQUIRED" if needs_arrangement else reason], "alternatives": options, "evidence": {**evidence, "confidence": "low"}, "permitted_actions": ["offer_alternative", "join_waitlist", "request_staff_booking"]}
 
 
 def seating_wait(db, loc, party):
@@ -199,6 +216,9 @@ def seating_wait(db, loc, party):
 def quote(db, loc, request):
     if loc.vertical != "restaurant":
         raise DomainError("WRONG_VERTICAL", "Takeout is only supported at restaurant locations", 422)
+    if loc.settings.get("catalog_provider"):
+        from .integration_service import require_adapter
+        require_adapter(db, loc, loc.settings["catalog_provider"], "menu_read")
     kitchen = db.scalar(select(KitchenState).where(KitchenState.location_id == loc.id, KitchenState.tenant_id == loc.tenant_id))
     if not kitchen or not freshness(loc, kitchen.verified_at):
         raise DomainError("UNKNOWN_KITCHEN", "Kitchen state needs staff verification")
@@ -207,8 +227,12 @@ def quote(db, loc, request):
     if not request.items:
         raise DomainError("EMPTY_CART", "Choose at least one menu item", 422)
     items, subtotal, units = [], 0, 0
+    from .integration_service import catalog_ids
+    selected_catalog = catalog_ids(db, loc)
     for line in request.items:
         item = db.get(MenuItem, line.item_id)
+        if selected_catalog is not None and line.item_id not in selected_catalog:
+            raise DomainError("CATALOG_CHANGED", "Choose an item from the selected provider catalog", 422)
         if not item or item.tenant_id != loc.tenant_id or item.location_id != loc.id or not item.available:
             raise DomainError("ITEM_UNAVAILABLE", "A selected menu item is unavailable", 422)
         modifiers = {m["id"]: m for m in item.modifiers}
@@ -241,17 +265,21 @@ def prepare(db, loc, request, call_id=None):
     # Live adapters are exposed separately; never silently make an internal booking
     # for a location configured to use an external authoritative provider.
     provider_key = "order_provider" if request.kind == "order" else "booking_provider"
-    if loc.settings.get(provider_key, "internal") != "internal":
-        raise DomainError("PROVIDER_WRITE_GATED", "This authoritative provider is not activated for writes")
+    authority = loc.settings.get(provider_key, "internal")
+    if authority not in ["internal", "staff_requests"]:
+        from .integration_service import require_adapter
+        require_adapter(db, loc, authority, "orders_write" if request.kind == "order" else "bookings_write")
+    if authority == "staff_requests" and call_id:
+        raise DomainError("STAFF_APPROVAL_REQUIRED", "Log a staff booking request; do not create an automatic reservation")
     if request.kind in ["cancel_booking", "reschedule_booking"]:
         if not request.booking_reference or not request.phone:
             raise DomainError("VERIFICATION_REQUIRED", "Provide the booking reference and matching contact phone", 422)
-        matches = list(db.scalars(select(Reservation).join(Customer).where(Reservation.tenant_id == loc.tenant_id, Reservation.location_id == loc.id, Reservation.id.like(request.booking_reference.lower() + "%"), Customer.phone == request.phone, Customer.tenant_id == loc.tenant_id)))
+        matches = list(db.scalars(select(Reservation).join(Customer).where(Reservation.tenant_id == loc.tenant_id, Reservation.location_id == loc.id, or_(Reservation.id.like(request.booking_reference.lower() + "%"), Reservation.external_id == request.booking_reference), Customer.phone == request.phone, Customer.tenant_id == loc.tenant_id)))
         if len(matches) != 1:
             raise DomainError("VERIFICATION_FAILED", "Booking reference or phone could not be verified", 404)
         record = matches[0]
-        if record.status != "confirmed" or record.provider != "internal":
-            raise DomainError("CHANGE_NOT_PERMITTED", "Only confirmed internal bookings can be changed by this workflow")
+        if record.status != "confirmed" or record.provider != ("internal" if authority == "staff_requests" else authority):
+            raise DomainError("CHANGE_NOT_PERMITTED", "Only confirmed bookings in the configured authoritative system can be changed")
         customer = db.get(Customer, record.customer_id)
         expected = {"booking_id": record.id, "expected_start_at": utc(record.start_at).isoformat(), "expected_end_at": utc(record.end_at).isoformat()}
         if request.kind == "cancel_booking":
@@ -264,7 +292,7 @@ def prepare(db, loc, request, call_id=None):
                 if request.service_id and request.service_id != record.service_id:
                     raise DomainError("SERVICE_CHANGED", "Staff assistance is required to change the service", 422)
                 request = request.model_copy(update={"service_id": record.service_id})
-            decision = availability(db, loc, Availability(location_id=loc.id, start_at=request.start_at, party_size=request.party_size, service_id=request.service_id, staff_id=request.staff_id), exclude=record.id)
+            decision = availability(db, loc, Availability(location_id=loc.id, start_at=request.start_at, party_size=request.party_size, service_id=request.service_id, staff_id=request.staff_id), exclude=record.id, force_internal=authority == "staff_requests")
             if decision["status"] != "AVAILABLE":
                 raise DomainError("NO_CAPACITY", "Replacement slot is unavailable. Check alternatives")
             decision.update(expected)
@@ -278,13 +306,16 @@ def prepare(db, loc, request, call_id=None):
     else:
         if (request.kind == "reservation") != (loc.vertical == "restaurant") or not request.start_at:
             raise DomainError("INVALID_ACTION", "Action and time must match the location's vertical", 422)
-        decision = availability(db, loc, Availability(location_id=loc.id, start_at=request.start_at, party_size=request.party_size, service_id=request.service_id, staff_id=request.staff_id))
+        decision = availability(db, loc, Availability(location_id=loc.id, start_at=request.start_at, party_size=request.party_size, service_id=request.service_id, staff_id=request.staff_id), force_internal=authority == "staff_requests" and not call_id)
         if decision["status"] != "AVAILABLE":
-            raise DomainError("NO_CAPACITY", "Requested slot unavailable; check alternatives")
-        when = utc(request.start_at).astimezone(ZoneInfo(loc.timezone)).strftime("%A %B %d at %I:%M %p")
+            unknown = decision["status"] == "UNKNOWN"
+            raise DomainError("AVAILABILITY_UNKNOWN" if unknown else "NO_CAPACITY", "Seating availability needs staff verification; no booking was created" if unknown else "That time is unavailable; offer the returned alternatives", decision=decision)
+        local = utc(request.start_at).astimezone(ZoneInfo(loc.timezone))
+        clock = f"{local.hour % 12 or 12}" + (f":{local.minute:02}" if local.minute else "") + local.strftime(" %p")
+        when = f"{local.strftime('%A, %B')} {local.day} at {clock}"
         detail = f"table for {request.party_size}" if request.kind == "reservation" else db.get(Service, request.service_id).name
-        summary = f"{detail} for {request.name} on {when} at {loc.name}."
-    action = PendingAction(tenant_id=loc.tenant_id, location_id=loc.id, call_id=call_id, kind=request.kind, payload={"request": request.model_dump(mode="json"), "decision": decision}, readback=f"Please confirm: {summary}", expires_at=now() + timedelta(minutes=5))
+        summary = f"{detail} for {request.name} on {when}."
+    action = PendingAction(tenant_id=loc.tenant_id, location_id=loc.id, call_id=call_id, kind=request.kind, payload={"request": request.model_dump(mode="json"), "decision": decision, "authority": authority}, readback=f"Please confirm: {summary}", expires_at=now() + timedelta(minutes=5))
     db.add(action)
     db.flush()
     # Supersede earlier proposals; an affirmative always applies to just this proposal.
@@ -292,7 +323,7 @@ def prepare(db, loc, request, call_id=None):
         for old in db.scalars(select(PendingAction).where(PendingAction.call_id == call_id, PendingAction.id != action.id, PendingAction.state == "awaiting_confirmation")):
             old.state = "superseded"
     emit(db, loc, "action.prepared", {"action_id": action.id, "kind": action.kind}, target=action.id)
-    return {"action_id": action.id, "status": action.state, "readback": action.readback, "expires_at": action.expires_at.isoformat(), "decision": decision}
+    return {"action_id": action.id, "status": action.state, "readback": action.readback, "next_action": "Read readback once, then commit_action after the caller agrees. Do not prepare again unless details change.", "expires_at": action.expires_at.isoformat(), "decision": decision}
 
 
 def normalize(text):
@@ -330,7 +361,7 @@ def confirm_staff(db, action):
 
 
 def commit(db, loc, action):
-    if action.state == "committed":
+    if action.state in ["committed", "pending_confirmation"]:
         return action.result
     if action.state != "awaiting_confirmation" or utc(action.expires_at) <= now():
         raise DomainError("ACTION_EXPIRED", "The proposal has expired or was superseded")
@@ -345,8 +376,14 @@ def commit(db, loc, action):
             raise DomainError("AI_ACTION_PAUSED", "Staff have paused this AI action. Request staff assistance")
     request = PrepareAction.model_validate(action.payload["request"])
     provider_key = "order_provider" if action.kind == "order" else "booking_provider"
-    if loc.settings.get(provider_key, "internal") != "internal":
-        raise DomainError("PROVIDER_WRITE_GATED", "The configured provider requires authoritative confirmation")
+    authority = loc.settings.get(provider_key, "internal")
+    if action.payload.get("authority", "internal") != authority:
+        raise DomainError("PROVIDER_CHANGED", "Provider selection changed; prepare and confirm a fresh action")
+    if authority not in ["internal", "staff_requests"]:
+        from .integration_service import commit_provider
+        return commit_provider(db, loc, action, request)
+    if authority == "staff_requests" and action.call_id:
+        raise DomainError("STAFF_APPROVAL_REQUIRED", "A staff member must manage this booking request")
     if action.kind in ["cancel_booking", "reschedule_booking"]:
         prior = action.payload["decision"]
         record = db.get(Reservation, prior["booking_id"])
@@ -356,7 +393,7 @@ def commit(db, loc, action):
             record.status = "cancelled"
             response = {"status": "cancelled", "id": record.id, "reference": record.id[:8].upper(), "kind": record.kind, "provider": "internal", "mode": loc.mode}
         else:
-            result = availability(db, loc, Availability(location_id=loc.id, start_at=request.start_at, party_size=request.party_size, service_id=request.service_id, staff_id=request.staff_id), exclude=record.id, alternatives=False)
+            result = availability(db, loc, Availability(location_id=loc.id, start_at=request.start_at, party_size=request.party_size, service_id=request.service_id, staff_id=request.staff_id), exclude=record.id, alternatives=False, force_internal=authority == "staff_requests")
             if result["status"] != "AVAILABLE" or result["resource_ids"] != prior["resource_ids"]:
                 raise DomainError("CAPACITY_CHANGED", "Replacement slot changed. Prepare and confirm a fresh proposal")
             for allocation in db.scalars(select(Allocation).where(Allocation.reservation_id == record.id, Allocation.tenant_id == loc.tenant_id)):
@@ -387,7 +424,7 @@ def commit(db, loc, action):
         response = {"status": "accepted", "id": record.id, "reference": record.id[:8].upper(), "kind": "order", "pickup_min": result["pickup_min"], "pickup_max": result["pickup_max"], "total_minor": record.total_minor, "provider": "internal", "mode": loc.mode}
     else:
         query = Availability(location_id=loc.id, start_at=request.start_at, party_size=request.party_size, service_id=request.service_id, staff_id=request.staff_id)
-        result = availability(db, loc, query, alternatives=False)
+        result = availability(db, loc, query, alternatives=False, force_internal=authority == "staff_requests")
         if result["status"] != "AVAILABLE":
             raise DomainError("CAPACITY_CHANGED", "The requested slot is no longer available")
         if result["resource_ids"] != action.payload["decision"]["resource_ids"]:
@@ -415,3 +452,4 @@ def lookup_order(db, loc, reference, phone):
         raise DomainError("VERIFICATION_FAILED", "Order reference or phone could not be verified", 404)
     row = matches[0]
     return {"status": row.state, "reference": row.id[:8].upper(), "pickup_min": utc(row.pickup_min).isoformat(), "pickup_max": utc(row.pickup_max).isoformat(), "provider": row.provider, "mode": loc.mode}
+

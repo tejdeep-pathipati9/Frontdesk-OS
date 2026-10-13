@@ -96,6 +96,7 @@ class LocationCreate(StrictModel):
     name: str = Field(min_length=1, max_length=120)
     vertical: Literal["restaurant", "salon"]
     timezone: str = "America/New_York"
+    existing_software: Literal["internal", "staff_requests", "mock_opentable", "mock_toast", "mock_square"] = "internal"
 
 
 class SettingsPatch(StrictModel):
@@ -110,6 +111,36 @@ class SettingsPatch(StrictModel):
     transfer_phone: str | None = Field(default=None, pattern=r"^(\+[1-9]\d{7,14})?$")
     preferred_voice_provider: Literal["vapi", "livekit"] | None = None
     ai_actions: dict[Literal["bookings", "takeout", "waitlist", "booking_changes"], bool] | None = None
+
+
+class IntegrationConnect(StrictModel):
+    location_id: str
+    booking_authority: Literal["internal", "staff_requests", "mock_opentable"] | None = None
+    order_authority: Literal["internal", "mock_square"] | None = None
+    scenario: Literal["normal", "unavailable", "stale", "failure", "ambiguous"] = "normal"
+
+
+class AuthoritySelection(StrictModel):
+    booking_provider: Literal["internal", "staff_requests", "mock_opentable"]
+    order_provider: Literal["internal", "mock_square"] = "internal"
+
+
+class StaffBookingRequest(StrictModel):
+    location_id: str
+    party_size: int = Field(ge=1, le=30)
+    start_at: datetime
+    reason: str = Field(default="Staff seating review requested", max_length=300)
+    @field_validator("start_at")
+    @classmethod
+    def aware(cls, value):
+        if value.tzinfo is None:
+            raise ValueError("Explicit timezone offset is required")
+        return value
+
+
+class SeatingArrangementReview(StrictModel):
+    resource_ids: list[str] = Field(min_length=1, max_length=10)
+    verified_arrangement: Literal[True]
 
 
 class ToolRequest(StrictModel):

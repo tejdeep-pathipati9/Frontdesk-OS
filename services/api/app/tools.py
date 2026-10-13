@@ -26,6 +26,8 @@ prepare_definition["parameters"]["properties"]["booking_reference"] = {"type": "
 prepare_definition["description"] += " For cancel_booking/reschedule_booking, collect the reference and contact phone for verification, then read back and commit as usual."
 TOOLS.append({"name": "get_order_status", "description": "Look up a customer's order using its reference and matching contact phone. Do not disclose an unverified order.", "parameters": {"type": "object", "properties": {"reference": {"type": "string"}, "phone": {"type": "string"}}, "required": ["reference", "phone"], "additionalProperties": False}})
 
+TOOLS.append({"name": "request_staff_booking", "description": "After caller permission, log an uncertain/large-party seating request for staff. This never confirms a reservation, table arrangement, or callback.", "parameters": {"type": "object", "properties": {"party_size": {"type": "integer", "minimum": 1, "maximum": 30}, "start_at": {"type": "string"}, "reason": {"type": "string"}}, "required": ["party_size", "start_at"], "additionalProperties": False}})
+
 AGENT_PROMPT = """You are this business's automated front desk. Introduce yourself as an automated assistant. Use get_business_info first for the business-local time and policies. Use backend tools for every availability, menu, price and status claim. Never invent table capacity, pickup estimates or booking success. Use explicit dates and timezone offsets. For bookings/orders: collect details, including a contact phone if the customer wants future lookup/changes, call prepare_action, say the entire returned readback EXACTLY, and wait for an unambiguous yes from the caller. Then call commit_action. A confirmed/accepted result and reference are required before you say it is booked/accepted. If CONFIRMATION_REQUIRED, explain you are checking and retry once after final transcript delivery, then escalate. For cancellation/rescheduling, collect booking_reference and matching phone; prepare_action kind cancel_booking/reschedule_booking verifies identity and creates a new readback. If verification fails or no contact phone exists, request staff assistance. If a proposal changes, prepare and read back again. A pause or unknown state blocks new commitments. Never collect cards or assure allergen safety. A transfer request is pending unless the actual phone transfer succeeds. Do not claim a callback was scheduled without consent."""
 
 
@@ -94,6 +96,9 @@ def execute_tool(db, call, name, args, request_id):
                 emit(db, loc, "call.escalation_requested", {"call_id": call.id, "reason": reason}, target=call.id)
                 call.outcome = "escalated" if call.outcome != "fulfilled" else call.outcome
                 result = {"status": "staff_followup_required", "message": "Staff assistance requested. No phone transfer has been completed.", "transfer_phone_configured": bool(loc.settings.get("transfer_phone"))}
+            elif name == "request_staff_booking":
+                from .integration_service import request_staff_review
+                result = request_staff_review(db, loc, s.StaffBookingRequest.model_validate(data), call)
             else:
                 raise DomainError("TOOL_NOT_ENABLED", "This tool is not enabled; ask staff for assistance", 422)
     except DomainError as error:

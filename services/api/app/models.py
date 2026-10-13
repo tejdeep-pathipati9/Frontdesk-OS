@@ -217,3 +217,42 @@ class AuditEvent(Owned, Base):
     target_id: Mapped[str] = mapped_column(String(64))
     detail: Mapped[dict] = mapped_column(JSON, default=dict)
     correlation_id: Mapped[str] = mapped_column(String(64), default=uid)
+
+
+class IntegrationConnection(Owned, Base):
+    __tablename__ = "integration_connections"
+    __table_args__ = (UniqueConstraint("location_id", "provider"),)
+    location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(30))
+    mode: Mapped[str] = mapped_column(String(30), default="mock")
+    status: Mapped[str] = mapped_column(String(30), default="not_synced")
+    capabilities: Mapped[dict] = mapped_column(JSON, default=dict)
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+
+class ProviderRecord(Owned, Base):
+    """Independent simulated system of record; never used for a live provider."""
+    __tablename__ = "mock_provider_records"
+    __table_args__ = (UniqueConstraint("location_id", "provider", "kind", "external_id"),)
+    location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(30))
+    kind: Mapped[str] = mapped_column(String(30))
+    external_id: Mapped[str] = mapped_column(String(100))
+    data: Mapped[dict] = mapped_column(JSON)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class OperationalProjection(Owned, Base):
+    """Read-only normalized copies, with stable provider identity and provenance."""
+    __tablename__ = "operational_projections"
+    __table_args__ = (UniqueConstraint("location_id", "provider", "kind", "external_id"),)
+    location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(30))
+    kind: Mapped[str] = mapped_column(String(30))
+    external_id: Mapped[str] = mapped_column(String(100))
+    data: Mapped[dict] = mapped_column(JSON)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
