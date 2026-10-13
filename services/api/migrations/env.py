@@ -1,5 +1,4 @@
 from alembic import context
-from sqlalchemy import create_engine, pool
 from app.config import settings
 from app.models import Base
 
@@ -12,8 +11,17 @@ if context.is_offline_mode():
     with context.begin_transaction():
         context.run_migrations()
 else:
-    connectable = create_engine(settings().database_url, poolclass=pool.NullPool)
-    with connectable.connect() as connection:
+    def run(connection):
         context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
         with context.begin_transaction():
             context.run_migrations()
+    supplied_connection = config.attributes.get("connection")
+    if supplied_connection is not None:
+        run(supplied_connection)
+    else:
+        # Use the same SQLite path normalization and pragmas as the API.
+        from app.db import make_engine
+        connectable = make_engine(settings().database_url)
+        with connectable.connect() as connection:
+            run(connection)
+        connectable.dispose()

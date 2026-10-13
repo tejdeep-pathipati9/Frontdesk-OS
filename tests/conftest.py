@@ -28,7 +28,8 @@ def client(database, monkeypatch):
     monkeypatch.setattr(auth, "Session", database)
     monkeypatch.setattr(main, "transaction", lambda: storage.transaction(database))
     monkeypatch.setattr(main, "init_db", lambda: None)
-    settings().demo_mode = True
+    monkeypatch.setattr(settings(), "demo_mode", True)
+    monkeypatch.setattr(settings(), "allow_demo_login", True)
     main.request_windows.clear()
     with TestClient(main.app) as test:
         result = test.post("/api/v1/auth/login", json={"email": "", "demo": True})

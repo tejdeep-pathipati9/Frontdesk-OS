@@ -1,11 +1,17 @@
 from contextlib import contextmanager
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import make_url
+from pathlib import Path
 from sqlalchemy.orm import sessionmaker
 from .config import settings
 from .models import Base
 
 
 def make_engine(url):
+    parsed = make_url(url)
+    if parsed.drivername.startswith("sqlite") and parsed.database and parsed.database != ":memory:" and not Path(parsed.database).is_absolute():
+        parsed = parsed.set(database=str((Path(__file__).resolve().parents[3] / parsed.database).resolve()))
+        url = parsed.render_as_string(hide_password=False)
     engine = create_engine(url, connect_args={"check_same_thread": False, "timeout": 30} if url.startswith("sqlite") else {}, pool_pre_ping=True)
     if url.startswith("sqlite"):
         @event.listens_for(engine, "connect")
@@ -41,4 +47,8 @@ def transaction(factory=Session):
 
 
 def init_db():
-    Base.metadata.create_all(engine)
+    if engine.dialect.name == "sqlite":
+        from .local_schema import migrate_sqlite
+        migrate_sqlite(engine)
+    else:
+        Base.metadata.create_all(engine)

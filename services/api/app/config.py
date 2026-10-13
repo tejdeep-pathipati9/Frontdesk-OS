@@ -6,8 +6,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     database_url: str = "sqlite:///./frontdesk.db"
     demo_mode: bool = True
+    allow_demo_login: bool = True
+    restaurant_name: str = "Momentuum Bistro"
     session_secret: str = "local-demo-only-change-before-live-use"
-    owner_email: str = "owner@frontdesk.local"
+    owner_email: str = "owner@momentuumbistro.local"
     owner_password: str = ""
     web_origin: str = "http://127.0.0.1:3000"
     vapi_webhook_secret: str = ""

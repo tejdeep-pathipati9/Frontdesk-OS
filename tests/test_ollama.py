@@ -8,13 +8,13 @@ def test_local_model_tool_loop_is_shared_and_labeled(client, monkeypatch):
     chats.clear()
     responses = iter([
         {"message": {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "get_business_info", "arguments": {}}}]}},
-        {"message": {"role": "assistant", "content": "Juniper & Rye is in America/New_York."}},
+        {"message": {"role": "assistant", "content": "Momentuum Bistro is in America/New_York."}},
     ])
     monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: httpx.Response(200, json=next(responses), request=httpx.Request("POST", "http://localhost/api/chat")))
     session = client.post("/api/v1/voice/ollama/session", json={"location_id": "demo-restaurant"}).json()
     result = client.post(f"/api/v1/voice/ollama/{session['call_id']}/chat", json={"text": "What is the business name?"}).json()
     assert result["provider"] == "ollama_text"
-    assert result["tool_results"][0]["result"]["name"] == "Juniper & Rye"
+    assert result["tool_results"][0]["result"]["name"] == "Momentuum Bistro"
     client.post(f"/api/v1/voice/ollama/{session['call_id']}/end")
     assert session["call_id"] not in chats
     detail = client.get(f"/api/v1/calls/{session['call_id']}").json()

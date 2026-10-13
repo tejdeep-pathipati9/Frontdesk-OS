@@ -1,5 +1,6 @@
 from datetime import timedelta
 from .models import Tenant, Membership, Location, Resource, Service, MenuItem, KitchenState, Reservation, Customer, Allocation, Event, now
+from .config import settings
 
 DEMO_TENANT = "demo-tenant"
 RESTAURANT = "demo-restaurant"
@@ -7,12 +8,31 @@ SALON = "demo-salon"
 
 
 def seed(db):
-    if db.get(Tenant, DEMO_TENANT):
+    cfg = settings()
+    tenant = db.get(Tenant, DEMO_TENANT)
+    if tenant:
+        # Preserve stable location IDs, voice mappings, history and capacity state.
+        if tenant.name == "FrontDesk Demo":
+            tenant.name = cfg.restaurant_name
+        restaurant = db.get(Location, RESTAURANT)
+        if restaurant and restaurant.name == "Juniper & Rye":
+            restaurant.name = cfg.restaurant_name
+        for location_id in [RESTAURANT, SALON]:
+            location = db.get(Location, location_id)
+            if location and "phone_country_code" not in location.settings:
+                location.settings = {**location.settings, "phone_country_code": "1"}
+        owner = db.get(Membership, "demo-owner")
+        if owner:
+            owner.email = cfg.owner_email
+        burger = db.get(MenuItem, "menu-burger")
+        if burger and burger.name == "Juniper burger":
+            burger.name = "Bistro burger"
         return
-    db.add(Tenant(id=DEMO_TENANT, name="FrontDesk Demo"))
-    db.add(Membership(id="demo-owner", tenant_id=DEMO_TENANT, email="owner@frontdesk.local", role="owner"))
+    db.add(Tenant(id=DEMO_TENANT, name=cfg.restaurant_name))
+    db.add(Membership(id="demo-owner", tenant_id=DEMO_TENANT, email=cfg.owner_email, role="owner"))
     policies = {"open_hour": 0, "close_hour": 24, "turn_minutes": 75, "cleaning_minutes": 10, "freshness_minutes": 30, "max_wait_minutes": 180, "tax_bps": 887, "intake_paused": False, "booking_provider": "internal", "order_provider": "internal", "currency": "USD", "transfer_phone": "", "combinations": [["table-5", "table-6"]]}
-    db.add(Location(id=RESTAURANT, tenant_id=DEMO_TENANT, name="Juniper & Rye", vertical="restaurant", settings=policies, mode="demo"))
+    policies["phone_country_code"] = "1"
+    db.add(Location(id=RESTAURANT, tenant_id=DEMO_TENANT, name=cfg.restaurant_name, vertical="restaurant", settings=policies, mode="demo"))
     db.add(Location(id=SALON, tenant_id=DEMO_TENANT, name="Studio Bloom", vertical="salon", settings={**policies, "combinations": []}, mode="demo"))
     db.flush()
     for i, capacity in enumerate([2, 2, 4, 4, 2, 2, 6, 8], start=1):
@@ -23,7 +43,7 @@ def seed(db):
     for service_id, name, minutes, price, eligible in [("service-cut", "Signature haircut", 45, 6500, ["stylist-1", "stylist-2", "stylist-3"]), ("service-color", "Color & finish", 90, 14500, ["stylist-1", "stylist-3"]), ("service-style", "Wash & style", 30, 4500, ["stylist-1", "stylist-2", "stylist-3"])]:
         db.add(Service(id=service_id, tenant_id=DEMO_TENANT, location_id=SALON, name=name, duration_min=minutes, buffer_min=10, price_minor=price, eligible_staff=eligible))
     for item_id, name, category, price, units, description, mods in [
-        ("menu-burger", "Juniper burger", "Mains", 1850, 3, "Grass-fed beef, aged cheddar, house pickles", [{"id": "extra-cheese", "name": "Extra cheddar", "price_minor": 200}, {"id": "no-onion", "name": "No onion", "price_minor": 0}]),
+        ("menu-burger", "Bistro burger", "Mains", 1850, 3, "Grass-fed beef, aged cheddar, house pickles", [{"id": "extra-cheese", "name": "Extra cheddar", "price_minor": 200}, {"id": "no-onion", "name": "No onion", "price_minor": 0}]),
         ("menu-pasta", "Wild mushroom pasta", "Mains", 2200, 4, "Roasted mushrooms, parmesan, fresh herbs", []),
         ("menu-salad", "Garden bowl", "Mains", 1450, 2, "Seasonal greens, roasted vegetables, citrus", [{"id": "add-chicken", "name": "Add chicken", "price_minor": 600}]),
         ("menu-fries", "Rosemary fries", "Sides", 650, 1, "Sea salt, rosemary, house aioli", []),

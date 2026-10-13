@@ -101,16 +101,17 @@ def health():
     url = make_url(settings().database_url)
     host = url.host or ""
     provider = "supabase" if host.endswith("supabase.co") or host.endswith("supabase.com") else "sqlite" if url.drivername.startswith("sqlite") else "postgresql"
-    return {"status": "ok", "demo_mode": settings().demo_mode, "database": {"provider": provider, "connected": True}}
+    return {"status": "ok", "demo_mode": settings().demo_mode, "demo_login_enabled": settings().demo_mode and settings().allow_demo_login, "database": {"provider": provider, "connected": True}}
+
 
 
 @app.post("/api/v1/auth/login")
 def login(body: s.Login, response: Response):
     cfg = settings()
     if body.demo:
-        if not cfg.demo_mode:
+        if not cfg.demo_mode or not cfg.allow_demo_login:
             raise DomainError("DEMO_DISABLED", "Demo login is disabled", 403)
-        email = "owner@frontdesk.local"
+        email = cfg.owner_email
     else:
         if not secret_matches(body.password, cfg.owner_password) or body.email != cfg.owner_email:
             raise DomainError("BAD_CREDENTIALS", "Email or password is incorrect", 401)
@@ -123,6 +124,7 @@ def login(body: s.Login, response: Response):
         data = {"tenant_id": member.tenant_id, "role": member.role, "email": member.email}
     response.set_cookie("frontdesk_session", token, httponly=True, secure=not cfg.demo_mode, samesite="strict", max_age=43200)
     return data
+
 
 
 @app.get("/api/v1/auth/me")

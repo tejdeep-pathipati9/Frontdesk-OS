@@ -7,4 +7,4 @@ from app.seed import seed
 init_db()
 with transaction() as db:
     seed(db)
-print("Demo data is ready. Existing operations were preserved.")
+print("Local workspace is ready. Existing operations were preserved.")

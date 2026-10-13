@@ -30,7 +30,7 @@ def test_token_dispatch_and_agent_authorization(client, database, monkeypatch):
     assert client.get(route, headers=headers).status_code == 200
     payload = {"request_id": "business-info", "name": "get_business_info", "arguments": {"location_id": "other-tenant"}}
     result = client.post(route + "/tools", json=payload, headers=headers).json()
-    assert result["name"] == "Juniper & Rye"
+    assert result["name"] == "Momentuum Bistro"
     transcript = {"event_id": "final1", "role": "user", "text": "Hello"}
     assert client.post(route + "/transcript", json=transcript, headers=headers).json()["status"] == "processed"
     assert client.post(route + "/transcript", json=transcript, headers=headers).json()["status"] == "already_processed"

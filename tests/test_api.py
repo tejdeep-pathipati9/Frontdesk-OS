@@ -7,6 +7,37 @@ from app.auth import token_for
 from app.config import settings
 
 
+def test_local_owner_login_without_passwordless_shortcut(client, monkeypatch):
+    cfg = settings()
+    monkeypatch.setattr(cfg, "allow_demo_login", False)
+    monkeypatch.setattr(cfg, "owner_password", "fixture-owner-password")
+    client.cookies.clear()
+    assert client.post("/api/v1/auth/login", json={"email": "", "demo": True}).status_code == 403
+    assert client.post("/api/v1/auth/login", json={"email": cfg.owner_email, "password": "wrong"}).status_code == 401
+    response = client.post("/api/v1/auth/login", json={"email": cfg.owner_email, "password": cfg.owner_password})
+    assert response.status_code == 200
+    assert "httponly" in response.headers["set-cookie"].lower()
+    assert client.get("/api/v1/auth/me").json()["email"] == cfg.owner_email
+    assert client.get(f"/api/v1/locations/{RESTAURANT}/snapshot").json()["location"]["name"] == "Momentuum Bistro"
+    assert client.get("/api/v1/health").json()["demo_login_enabled"] is False
+
+
+def test_workspace_rename_preserves_existing_state(database):
+    from app.seed import seed
+    from app.models import Resource
+    with transaction(database) as db:
+        restaurant = db.get(Location, RESTAURANT)
+        restaurant.name = "Juniper & Rye"
+        db.get(Tenant, restaurant.tenant_id).name = "FrontDesk Demo"
+        table = db.get(Resource, "table-1")
+        table.state = "cleaning"
+        verified_at = table.verified_at
+        seed(db)
+        seed(db)
+        assert restaurant.name == "Momentuum Bistro"
+        assert table.state == "cleaning" and table.verified_at == verified_at
+
+
 def test_auth_and_cross_tenant_denied(client, database):
     assert client.get(f"/api/v1/locations/{RESTAURANT}/snapshot").status_code == 200
     with transaction(database) as db:
