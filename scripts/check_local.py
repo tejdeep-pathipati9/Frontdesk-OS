@@ -1,12 +1,16 @@
 """Read-only HTTP readiness checks against the two local services."""
 import httpx
+from pathlib import Path
+from dotenv import dotenv_values
+
+cfg = dotenv_values(Path(__file__).resolve().parents[1] / ".env")
 
 with httpx.Client(timeout=30) as client:
     health = client.get("http://127.0.0.1:8000/api/v1/health")
     health.raise_for_status()
     assert health.json()["database"]["connected"]
     print("API health: ok · database:", health.json()["database"]["provider"], flush=True)
-    pages = {"restaurant": ["overview", "floor", "reservations", "waitlist", "kitchen", "orders", "menu", "calls", "attention", "voice", "customers", "integrations", "settings"], "salon": ["overview", "calendar", "staff", "services", "calls", "attention", "voice", "customers", "integrations", "settings"]}
+    pages = {"restaurant": ["overview", "floor", "reservations", "waitlist", "kitchen", "orders", "menu", "calls", "attention", "voice", "assistant", "integrations", "settings"], "salon": ["overview", "calendar", "staff", "services", "calls", "attention", "voice", "assistant", "integrations", "settings"]}
     paths = ["/"] + [f"/app/{vertical}/{section}" for vertical, sections in pages.items() for section in sections]
     for path in paths:
         response = client.get("http://127.0.0.1:3000" + path)
@@ -16,17 +20,17 @@ with httpx.Client(timeout=30) as client:
     font = client.get("http://127.0.0.1:3000/fonts/inter-latin.woff2")
     font.raise_for_status()
     assert font.content[:4] == b"wOF2"
-    login = client.post("http://127.0.0.1:3000/api/v1/auth/login", json={"email": "", "demo": True}, headers={"Origin": "http://127.0.0.1:3000"})
+    login = client.post("http://127.0.0.1:3000/api/v1/auth/login", json={"email": cfg.get("OWNER_EMAIL"), "password": cfg.get("OWNER_PASSWORD")}, headers={"Origin": "http://127.0.0.1:3000"})
     login.raise_for_status()
     snapshot = client.get("http://127.0.0.1:3000/api/v1/locations/demo-restaurant/snapshot")
     snapshot.raise_for_status()
-    assert snapshot.json()["location"]["name"] == "Juniper & Rye"
+    assert snapshot.json()["location"]["name"] == "Momentuum Bistro"
     for location in ["demo-restaurant", "demo-salon"]:
-        for route in [f"/locations/{location}/snapshot", f"/attention?location_id={location}", f"/customers?location_id={location}", f"/integrations?location_id={location}", f"/voice/config?location_id={location}"]:
+        for route in [f"/locations/{location}/snapshot", f"/attention?location_id={location}", f"/assistant/summary?location_id={location}", f"/integrations?location_id={location}", f"/voice/config?location_id={location}"]:
             result = client.get("http://127.0.0.1:3000/api/v1" + route)
             result.raise_for_status()
             assert result.headers.get("x-correlation-id")
-    print("Next.js proxy: authenticated snapshots, attention, customers, integrations and voice config for both verticals: PASS", flush=True)
+    print("Next.js proxy: authenticated snapshots, attention, AI metrics, integrations and voice config for both verticals: PASS", flush=True)
     with client.stream("GET", "http://127.0.0.1:3000/api/v1/realtime?location_id=demo-restaurant") as stream:
         stream.raise_for_status()
         assert "text/event-stream" in stream.headers["content-type"]
