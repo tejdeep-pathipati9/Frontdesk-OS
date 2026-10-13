@@ -1,4 +1,10 @@
-"""Webhook-only local origin for the temporary Vapi HTTPS tunnel."""
+"""Webhook-only local origin for the temporary Vapi HTTPS tunnel.
+
+Usage: uvicorn scripts.vapi_gateway:app (or run directly; serves on :8010).
+Touches: reads VAPI_WEBHOOK_SECRET from .env and forwards only POST /api/v1/voice/vapi
+to FastAPI (:8000); docs/openapi are disabled and request bodies are capped at 2 MiB.
+Side effects: network forwarding only; exits if the secret is not configured.
+"""
 from pathlib import Path
 import secrets
 import httpx

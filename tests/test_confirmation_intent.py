@@ -14,6 +14,33 @@ from app.models import Call, Location, PendingAction, Reservation, Event, now
 from app.schemas import PrepareAction
 
 
+def test_warmup_is_nonblocking_throttled_and_has_no_customer_data(monkeypatch):
+    monkeypatch.setattr(settings(), 'ollama_confirmation_enabled', True)
+    monkeypatch.setattr(gate, '_last_warm_attempt', float('-inf'))
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    requests = []
+    def post(url, **kwargs):
+        requests.append(kwargs['json'])
+        started.set()
+        try:
+            assert release.wait(3)
+            return httpx.Response(200, request=httpx.Request('POST', url), json={})
+        finally:
+            finished.set()
+    monkeypatch.setattr(gate.httpx, 'post', post)
+    gate.request_warm()
+    try:
+        assert started.wait(1)
+        gate.request_warm()
+        assert len(requests) == 1
+        assert requests[0]['options']['num_ctx'] == 2048
+        assert requests[0]['keep_alive'] == '15m'
+        assert 'Synthetic warm-up' in requests[0]['messages'][1]['content']
+    finally:
+        release.set()
+        assert finished.wait(2)
+
+
 @pytest.fixture
 def hybrid(database, monkeypatch):
     monkeypatch.setattr(settings(), 'ollama_confirmation_enabled', True)

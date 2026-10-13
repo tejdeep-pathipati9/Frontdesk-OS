@@ -1,4 +1,10 @@
-"""Verify the authenticated public webhook before a browser starts voice audio."""
+"""Verify the authenticated public webhook before a browser starts voice audio.
+
+Fit: the dashboard asks check_webhook() before it starts a Vapi call. The probe
+sends a synthetic status-update with an unmapped assistant id and expects the
+authenticated 403 UNKNOWN_ASSISTANT, which proves the tunnel, bearer secret and
+webhook routing all work without creating any call row.
+"""
 from urllib.parse import urlsplit
 import ipaddress
 import re
@@ -8,6 +14,12 @@ from .domain import DomainError
 
 
 def post_probe(base_url, secret, *, method='POST', path='/api/v1/voice/vapi', payload=None):
+    """Send the readiness probe (POST by default) to the webhook and return the httpx response.
+
+    Redirects and proxy env are disabled. On a DNS failure for a *.trycloudflare.com quick-tunnel host only,
+    resolve it via DNS-over-HTTPS (accepting global addresses only) and connect to that IP while keeping
+    the original Host/SNI so TLS verification still applies. Other errors propagate.
+    """
     if method not in ['GET', 'POST'] or not path.startswith('/') or path.startswith('//'):
         raise ValueError('Invalid boundary probe')
     endpoint = base_url.rstrip('/') + path
@@ -42,6 +54,11 @@ def post_probe(base_url, secret, *, method='POST', path='/api/v1/voice/vapi', pa
 
 
 def check_webhook(base_url, secret):
+    """Return {'status': 'ready'} if the public HTTPS webhook accepts the secret and rejects the probe assistant.
+
+    Raises DomainError VAPI_NOT_CONFIGURED for a missing secret or a non-origin/non-HTTPS URL (no credentials,
+    query, fragment or path), and retryable VAPI_CONNECTION_UNAVAILABLE for any unexpected response or transport error.
+    """
     try:
         url = urlsplit(base_url)
     except ValueError:

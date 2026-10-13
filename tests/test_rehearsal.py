@@ -1,3 +1,4 @@
+"""Rehearsal sample-state refresh helpers."""
 from app.db import transaction
 from app.models import Location, Resource, KitchenState, Reservation, now
 from app.seed import RESTAURANT

@@ -1,3 +1,4 @@
+"""AI assistant endpoints and summaries."""
 from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
@@ -120,3 +121,26 @@ def test_party_size_words_are_resolved_without_silently_clamping():
     assert assistant.fallback_plan('What is the seating wait for twelve guests?').party_size == 12
     assert assistant.fallback_plan('What is the wait for twenty-four guests?').party_size == 24
     assert assistant.fallback_plan('What is the wait for 100 guests?').topic == 'unsupported'
+
+
+@pytest.mark.parametrize('question,model_plan,topic,size', [
+    ('What is the seating wait for four guests?', {'topic': 'reservations', 'query': 'four guests'}, 'wait_times', 4),
+    ('Show our menu and prices.', {'topic': 'menu', 'query': 'menu and prices'}, 'menu', 2),
+    ('Show cancelled reservations.', {'topic': 'reservations', 'query': 'cancelled reservations'}, 'reservations', 2),
+])
+def test_real_report_questions_cannot_be_redirected_or_filtered_by_generic_words(monkeypatch, question, model_plan, topic, size):
+    import json
+    plan = {'topic': 'overview', 'period': 'today', 'query': '', 'status': 'all', 'party_size': 1, **model_plan}
+    monkeypatch.setattr(assistant.httpx, 'post', lambda *a, **kw: httpx.Response(200, json={'message': {'content': json.dumps(plan)}}, request=httpx.Request('POST', 'http://localhost')))
+    actual, engine = offline_interpreter(question)
+    assert actual.topic == topic and actual.period == 'all' and actual.query == '' and actual.party_size == size
+    if 'cancelled' in question:
+        assert actual.status == 'cancelled'
+
+
+def test_mutation_request_is_identified_before_contacting_model(monkeypatch):
+    def unexpected(*a, **kw):
+        raise AssertionError('A command does not need a model report plan')
+    monkeypatch.setattr(assistant.httpx, 'post', unexpected)
+    actual, engine = offline_interpreter('Cancel all bookings.')
+    assert actual.topic == 'action' and engine == 'saved_records'

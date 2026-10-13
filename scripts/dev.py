@@ -1,4 +1,10 @@
-"""One-command native development launcher; no Docker daemon required."""
+"""One-command native development launcher; no Docker daemon required.
+
+Usage: python scripts/dev.py   (no flags; Ctrl-C stops everything)
+Touches: creates .venv and installs dependencies if missing, then starts FastAPI and
+the Next.js dev server as child processes (NEXT_TELEMETRY_DISABLED=1).
+Side effects: long-running subprocesses; SIGINT/SIGTERM are forwarded to them.
+"""
 import os
 from pathlib import Path
 import signal

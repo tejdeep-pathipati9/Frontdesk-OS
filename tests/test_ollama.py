@@ -1,3 +1,4 @@
+"""Ollama text-chat integration and session handling."""
 import httpx
 from datetime import timedelta
 from app.models import now

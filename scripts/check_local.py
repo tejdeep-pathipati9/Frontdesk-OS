@@ -1,4 +1,10 @@
-"""Read-only HTTP readiness checks against the two local services."""
+"""Read-only HTTP readiness checks against the two local services.
+
+Usage: python scripts/check_local.py   (no flags)
+Touches: GET /api/v1/health on FastAPI (127.0.0.1:8000) and the web app (127.0.0.1:3000);
+reads the ignored .env for the owner login.
+Side effects: none beyond a login request; it exits non-zero via assertion on failure.
+"""
 import httpx
 from pathlib import Path
 from dotenv import dotenv_values

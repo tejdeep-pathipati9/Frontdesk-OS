@@ -1,3 +1,4 @@
+"""Vapi setup/export scripts and configuration drafts."""
 import sys
 from pathlib import Path
 from datetime import timedelta
@@ -154,3 +155,14 @@ def test_saved_assistant_has_dynamic_business_local_date_context():
     assert 'That is right' in prompt and 'magic phrase' in prompt
     assert config['model']['temperature'] == 0.1
     assert all(t['async'] is False and t['messages'] == [{'type': 'request-start', 'content': ''}] for t in config['model']['tools'])
+
+
+def test_phone_endpointing_waits_for_number_groups_and_preserves_disclosure():
+    config = assistant_config('https://webhook.example', 'credential', 'restaurant', transcript_retention_calls=10)
+    plan = config['startSpeakingPlan']
+    assert plan['transcriptionEndpointingPlan']['onNumberSeconds'] >= 1.5
+    assert plan['customEndpointingRules'][0]['timeoutSeconds'] == 2.0
+    assert plan['customEndpointingRules'][0]['regexOptions'] == [{'type': 'ignore-case', 'enabled': True}]
+    assert 'smartEndpointingPlan' not in plan  # Would override transcription settings.
+    assert 'Momentuum Bistro' in config['firstMessage']
+    assert 'automated' in config['firstMessage'] and 'transcript' in config['firstMessage']

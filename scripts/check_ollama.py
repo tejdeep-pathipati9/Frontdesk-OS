@@ -1,4 +1,10 @@
-"""Exercise the real local model against an isolated demo database, without audio."""
+"""Exercise the real local model against an isolated demo database, without audio.
+
+Usage: python scripts/check_ollama.py   (no flags)
+Touches: a temporary SQLite database (DATABASE_URL is overridden before the app is
+imported, with DEMO_MODE/ALLOW_DEMO_LOGIN enabled) and the local Ollama server.
+Side effects: none on the dashboard database; the temp directory is discarded on exit.
+"""
 import os
 from pathlib import Path
 import sys

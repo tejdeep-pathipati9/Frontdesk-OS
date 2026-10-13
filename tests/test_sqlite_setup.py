@@ -1,3 +1,4 @@
+"""SQLite setup and Alembic migration checks."""
 from alembic import command
 from alembic.config import Config
 from alembic.migration import MigrationContext

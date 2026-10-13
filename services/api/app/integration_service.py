@@ -4,6 +4,18 @@ Only mock adapters perform writes in this prototype. Live vendor access remains
 permission-gated; the existing real HTTP clients are retained in providers.py.
 No simulated result can activate a live connection. Mock writes use the same
 database transaction lock as internal writes, but a separate system of record.
+
+Role in the system: this is the orchestration layer between the deterministic
+booking/order engine (domain.py) and provider adapters (integration_adapters.py).
+It owns four concerns:
+  * connection lifecycle (connect / sync / describe) and freshness gating;
+  * authority selection (which provider is the single writer for bookings,
+    orders, floor and catalog), switched only when no commitments are in flight;
+  * projecting provider records into local tables (apply_record) using stable
+    ids so repeated syncs are idempotent upserts;
+  * committing confirmed PendingActions to the authoritative provider
+    (commit_provider) and reconciling ambiguous results later (reconcile).
+Callers must hold the usual DB transaction; functions here flush but never commit.
 """
 from datetime import timedelta
 from uuid import uuid5, NAMESPACE_URL
@@ -20,18 +32,30 @@ LIVE_CAPABILITIES = {
 
 
 def stable_id(loc, provider, kind, external_id):
+    """Deterministic UUIDv5 for a provider-sourced row, scoped by tenant/location/provider/kind/external id.
+
+    Re-syncing the same external record always maps to the same local id (idempotent upsert).
+    """
     return str(uuid5(NAMESPACE_URL, f"frontdesk:{loc.tenant_id}:{loc.id}:{provider}:{kind}:{external_id}"))
 
 
 def connection(db, loc, provider):
+    """Return the IntegrationConnection for (tenant, location, provider), or None."""
     return db.scalar(select(IntegrationConnection).where(IntegrationConnection.tenant_id == loc.tenant_id, IntegrationConnection.location_id == loc.id, IntegrationConnection.provider == provider))
 
 
 def context(loc, conn):
+    """Build the ProviderContext handed to adapters; the scenario comes from connection config (mock fault injection)."""
     return ProviderContext(loc.tenant_id, loc.id, loc.timezone, conn.config.get("scenario", "normal"))
 
 
 def require_adapter(db, loc, provider, capability=None, require_fresh=True):
+    """Gate for every provider call; returns (adapter, connection).
+
+    Raises PROVIDER_WRITE_GATED unless a connected mock adapter exists (live providers are never activated),
+    UNSUPPORTED_CAPABILITY if the capability is not 'supported', and STALE_PROVIDER_DATA if
+    require_fresh and the last healthy sync is older than the freshness window (default 30 min).
+    """
     conn = connection(db, loc, provider)
     if provider not in MOCK_ADAPTERS or not conn or conn.mode != "mock" or conn.status == "disconnected":
         raise DomainError("PROVIDER_WRITE_GATED", "Provider credentials/permissions and normalized integration are not activated", 503)
@@ -43,6 +67,13 @@ def require_adapter(db, loc, provider, capability=None, require_fresh=True):
 
 
 def choose_authority(db, loc, key, provider):
+    """Switch the authoritative provider for `key` ('booking_provider' or 'order_provider').
+
+    No-op if unchanged. Refuses (PROVIDER_SWITCH_CONFLICT) while active commitments owned by another
+    source or live pending proposals exist, so a commitment never straddles two authorities.
+    Side effects: updates loc.settings and emits integration.authority_changed.
+    """
+    # Authority selection: compare against the currently configured source (default internal).
     previous = loc.settings.get(key, "internal")
     if previous == provider:
         return
@@ -51,6 +82,7 @@ def choose_authority(db, loc, key, provider):
     # Read-only POS imports are not competing FrontDesk commitments. Existing
     # bookings, however, must remain with their source even when imported.
     active = any((r.state in ["accepted", "preparing", "ready", "pending_confirmation"] and (r.provider == previous or not r.idempotency_key.startswith("import:")) if model is Order else r.status in ["confirmed", "seated", "pending_confirmation"] and utc(r.end_at) > now()) and r.provider != ("internal" if provider == "staff_requests" else provider) for r in rows)
+    # Proposals that are still live (not expired) also block an authority switch.
     pending = db.scalar(select(PendingAction.id).where(PendingAction.location_id == loc.id, PendingAction.tenant_id == loc.tenant_id, or_(PendingAction.state == "pending_confirmation", and_(PendingAction.state == "awaiting_confirmation", PendingAction.expires_at > now()))))
     if active or pending:
         raise DomainError("PROVIDER_SWITCH_CONFLICT", "Resolve active commitments and proposals before changing the authoritative provider")
@@ -59,6 +91,12 @@ def choose_authority(db, loc, key, provider):
 
 
 def connect(db, loc, provider, booking_authority=None, order_authority=None, scenario="normal"):
+    """Onboard a mock provider for a demo restaurant location, choose its roles, then sync.
+
+    Validates vertical, provider support and requested authorities against adapter capabilities;
+    sets hours/floor/catalog sources from what the adapter can read. Side effects: creates or updates
+    the IntegrationConnection and loc.settings, then runs sync(). Returns describe() output.
+    """
     if loc.vertical != "restaurant":
         raise DomainError("WRONG_VERTICAL", "Restaurant integration onboarding applies to restaurants", 422)
     if provider not in MOCK_ADAPTERS:
@@ -101,6 +139,12 @@ def connect(db, loc, provider, booking_authority=None, order_authority=None, sce
 
 
 def sync(db, loc, conn):
+    """Pull a provider bundle, project it locally, reconcile pending commitments and update health.
+
+    Never raises for provider failures: a DomainError marks the connection 'degraded' and returns
+    {status, error_code}. Otherwise returns {status, records}; status is 'stale' when the oldest
+    observed_at exceeds the freshness window. Side effects: DB writes and audit events.
+    """
     adapter, _ = require_adapter(db, loc, conn.provider, require_fresh=False)
     conn.last_attempt_at = now()
     try:
@@ -109,9 +153,11 @@ def sync(db, loc, conn):
         conn.status, conn.error_code = "degraded", error.code
         emit(db, loc, "integration.sync_failed", {"provider": conn.provider, "error_code": error.code})
         return {"status": "degraded", "error_code": error.code}
+    # Freshness is judged by the oldest observation in the bundle.
     observed = min((r["observed_at"] for r in bundle), default=now())
     conn.last_sync_at, conn.error_code = observed, None
     conn.status = "stale" if now() - utc(observed) > timedelta(minutes=loc.settings.get("freshness_minutes", 30)) else "healthy"
+    # Order matters: tables first, POS signals last, so signals attach to existing tables.
     for record in sorted(bundle, key=lambda r: {"table": 0, "pos_signal": 2}.get(r["kind"], 1)):
         apply_record(db, loc, conn, record)
     reconcile(db, loc, conn)
@@ -126,6 +172,12 @@ def sync(db, loc, conn):
 
 
 def apply_record(db, loc, conn, record):
+    """Upsert one provider record into OperationalProjection and the local mirror tables.
+
+    Handles configuration (hours), table, pos_signal, menu, reservation and order kinds. Provider
+    imports never verify physical table availability; staff-disabled menu items stay disabled.
+    Idempotent via stable ids / (provider, external_id) lookup. Flushes but does not commit.
+    """
     kind, external_id, data = record["kind"], record["external_id"], dict(record["data"])
     row = db.scalar(select(OperationalProjection).where(OperationalProjection.tenant_id == loc.tenant_id, OperationalProjection.location_id == loc.id, OperationalProjection.provider == conn.provider, OperationalProjection.kind == kind, OperationalProjection.external_id == external_id))
     if not row:
@@ -185,6 +237,7 @@ def apply_record(db, loc, conn, record):
 
 
 def catalog_ids(db, loc):
+    """Ids of menu items orderable under the active catalog provider (or the non-imported internal menu when none is set)."""
     provider = loc.settings.get("catalog_provider")
     if not provider:
         imported = {r.data.get("local_id") for r in db.scalars(select(OperationalProjection).where(OperationalProjection.location_id == loc.id, OperationalProjection.tenant_id == loc.tenant_id, OperationalProjection.kind == "menu"))}
@@ -193,6 +246,12 @@ def catalog_ids(db, loc):
 
 
 def provider_availability(db, loc, query, exclude=None):
+    """Availability decision when a non-internal booking authority is selected.
+
+    Never raises: failures degrade to status UNKNOWN with reason codes and only
+    'request_staff_booking' permitted. Evidence records source, freshness and confidence;
+    on NO_CAPACITY up to three alternatives (30-minute steps) are searched.
+    """
     provider = loc.settings.get("booking_provider", "internal")
     evidence = {"sources": [provider], "source_provider": provider, "as_of": now().isoformat(), "mode": "mock" if provider.startswith("mock_") else "live", "confidence": "low"}
     if provider == "staff_requests":
@@ -203,7 +262,7 @@ def provider_availability(db, loc, query, exclude=None):
         return {"status": "UNKNOWN", "reason_codes": ["STAFF_OVERRIDE_REQUIRES_PROVIDER_REVIEW"], "alternatives": [], "evidence": evidence, "permitted_actions": ["request_staff_booking"]}
     try:
         adapter, conn = require_adapter(db, loc, provider, "availability_read")
-        request = query.model_dump(mode="json")
+        request = query.model_dump(mode="json", exclude={"search", "end_at"})
         row = db.get(Reservation, exclude) if exclude else None
         result = adapter.availability(db, context(loc, conn), request, row.external_id if row and row.provider == provider else None)
         evidence.update(last_sync_at=utc(conn.last_sync_at).isoformat(), confidence="medium", limitations=["Provider availability does not prove current physical occupancy"])
@@ -221,6 +280,14 @@ def provider_availability(db, loc, query, exclude=None):
 
 
 def commit_provider(db, loc, action, request):
+    """Execute a confirmed PendingAction against the authoritative provider and mirror the result locally.
+
+    Revalidates everything at commit time (authority unchanged, capability, freshness, internal staff
+    constraints, expected booking times, quote and catalog prices) so stale proposals fail closed
+    (PROVIDER_CHANGED, CAPACITY_CHANGED, BOOKING_CHANGED, QUOTE_CHANGED, ...). The action id is the
+    provider idempotency key. An 'ambiguous' provider result leaves the action pending_confirmation
+    until reconcile() sees it confirmed. Returns the response dict stored on action.result.
+    """
     provider = action.payload["authority"]
     key = "order_provider" if action.kind == "order" else "booking_provider"
     if loc.settings.get(key, "internal") != provider:
@@ -260,6 +327,7 @@ def commit_provider(db, loc, action, request):
             raise DomainError("PROVIDER_CONFLICT", "Provider capacity changed. Confirm a fresh proposal")
         result = adapter.create_booking(db, context(loc, conn), request.model_dump(mode="json"), action.id)
         kind = "reservation"
+    # Re-read the provider's record and project it so the local mirror reflects remote truth.
     remote = next(r for r in adapter.rows(db, context(loc, conn), kind) if r.external_id == result["external_id"])
     data = {**remote.data, "status" if kind == "reservation" else "state": result["status"]}
     apply_record(db, loc, conn, {"kind": kind, "external_id": remote.external_id, "data": data, "observed_at": now()})
@@ -282,9 +350,14 @@ def commit_provider(db, loc, action, request):
 
 
 def reconcile(db, loc, conn):
+    """Promote pending_confirmation actions to committed once the provider record shows a final status.
+
+    Only runs for healthy connections; resolves the matching attention events as reviewed.
+    """
     if conn.status != "healthy":
         return
     for action in db.scalars(select(PendingAction).where(PendingAction.location_id == loc.id, PendingAction.tenant_id == loc.tenant_id, PendingAction.state == "pending_confirmation")):
+        # Reconcile: only actions owned by this provider that already have a provider result.
         if action.payload.get("authority") != conn.provider or not action.result:
             continue
         remote = db.scalar(select(ProviderRecord).where(ProviderRecord.location_id == loc.id, ProviderRecord.tenant_id == loc.tenant_id, ProviderRecord.provider == conn.provider, ProviderRecord.external_id == action.result["external_id"]))
@@ -300,11 +373,13 @@ def reconcile(db, loc, conn):
 
 
 def describe(db, loc, conn):
+    """Serializable connection status for the dashboard; sync_status reports 'stale' when a healthy sync has aged out."""
     stale = not conn.last_sync_at or now() - utc(conn.last_sync_at) > timedelta(minutes=loc.settings.get("freshness_minutes", 30))
     return {"provider": conn.provider, "mode": conn.mode, "capabilities": conn.capabilities, "connection_status": conn.status, "sync_status": "stale" if stale and conn.status == "healthy" else conn.status, "last_sync_at": utc(conn.last_sync_at).isoformat() if conn.last_sync_at else None, "last_attempt_at": utc(conn.last_attempt_at).isoformat() if conn.last_attempt_at else None, "error_code": conn.error_code, "scenario": conn.config.get("scenario"), "booking_authority": loc.settings.get("booking_provider", "internal") == conn.provider, "order_authority": loc.settings.get("order_provider", "internal") == conn.provider, "detail": "Simulated provider with a separate persistent system of record. Not a live vendor connection."}
 
 
 def change_booking(db, loc, row, request=None):
+    """Cancel (request is None) or modify an imported booking through its authoritative provider, then re-project it."""
     if row.provider != loc.settings.get("booking_provider"):
         raise DomainError("PROVIDER_CHANGED", "Manage this booking in its authoritative provider")
     adapter, conn = require_adapter(db, loc, row.provider, "bookings_modify" if request else "bookings_cancel")
@@ -319,11 +394,16 @@ def change_booking(db, loc, row, request=None):
 
 
 def catalog():
+    """Static onboarding catalog: selectable mocks plus the live OpenTable entry that needs partner access (never impersonated)."""
     mocks = [{"provider": p, "mode": "mock", "capabilities": adapter.capabilities, "connection_status": "not_connected", "detail": "Explicitly simulated sample data; not live vendor capabilities."} for p, adapter in MOCK_ADAPTERS.items()]
     return mocks + [{"provider": "opentable", "mode": "not_configured", "capabilities": {key: "requires_permission" if key in LIVE_CAPABILITIES["opentable"] else "unsupported" for key in CAPABILITIES}, "detail": "OpenTable partner credentials and approved API access are required. No live endpoints are impersonated."}]
 
 
 def request_staff_review(db, loc, request, call=None):
+    """Log a capacity.review_required event asking staff to arrange seating; never confirms a booking.
+
+    Idempotent per call: a retry with the same call/party/start returns the existing request.
+    """
     if loc.vertical != "restaurant":
         raise DomainError("WRONG_VERTICAL", "Seating arrangement requests apply to restaurants", 422)
     if utc(request.start_at) < now() or utc(request.start_at) > now() + timedelta(days=90):

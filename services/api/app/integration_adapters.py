@@ -2,6 +2,12 @@
 
 Mock capabilities describe fixtures, not vendor account permissions. ProviderRecord
 is the simulated remote authority; local reservations are only its projections.
+
+Fit: integration_service.py talks only to these adapters (never to ProviderRecord
+directly for writes). MOCK_ADAPTERS are the activatable simulations; PROVIDERS also
+lists the internal facade and the gated live adapters, which always refuse. Mock
+`scenario` values (normal, failure, stale, unavailable, ambiguous) inject faults.
+Write methods take an idempotency key so replays return the original result.
 """
 from dataclasses import dataclass
 from datetime import timedelta
@@ -17,6 +23,7 @@ CAPABILITIES = ("configuration_read", "tables_read", "table_status_read", "pos_s
 
 @dataclass(frozen=True)
 class ProviderContext:
+    """Immutable per-call scope: tenant, location, timezone and mock fault scenario."""
     tenant_id: str
     location_id: str
     timezone: str
@@ -24,6 +31,7 @@ class ProviderContext:
 
 
 class RestaurantProvider(Protocol):
+    """Structural contract every adapter implements (fetch, availability, booking and order writes)."""
     provider: str
     capabilities: dict[str, str]
     def fetch(self, db, context: ProviderContext) -> list[dict]: ...
@@ -35,6 +43,11 @@ class RestaurantProvider(Protocol):
 
 
 class MockProvider:
+    """Base for simulated vendors; persists a separate system of record in ProviderRecord.
+
+    Subclasses declare `supported` capabilities and implement seed()/availability(); unsupported
+    capabilities raise UNSUPPORTED_CAPABILITY via require().
+    """
     provider = "mock"
     supported: tuple[str, ...] = ()
     @property
@@ -44,11 +57,13 @@ class MockProvider:
         if capability not in self.supported:
             raise DomainError("UNSUPPORTED_CAPABILITY", f"{self.provider} does not support {capability}", 422)
     def rows(self, db, context, kind=None):
+        """Provider-scoped ProviderRecord rows for this location, optionally filtered by kind."""
         query = select(ProviderRecord).where(ProviderRecord.location_id == context.location_id, ProviderRecord.tenant_id == context.tenant_id, ProviderRecord.provider == self.provider)
         if kind:
             query = query.where(ProviderRecord.kind == kind)
         return list(db.scalars(query))
     def add(self, db, ctx, kind, external_id, data):
+        """Insert and flush a new simulated remote record."""
         row = ProviderRecord(tenant_id=ctx.tenant_id, location_id=ctx.location_id, provider=self.provider, kind=kind, external_id=external_id, data=data)
         db.add(row)
         db.flush()
@@ -56,6 +71,7 @@ class MockProvider:
     def seed(self, db, ctx):
         raise NotImplementedError
     def fetch(self, db, ctx):
+        """Return the provider's records as a sync bundle, seeding fixtures on first use. Scenario 'failure' raises PROVIDER_UNREACHABLE; 'stale' backdates observed_at by four hours. Seating units stay internal to the provider."""
         if ctx.scenario == "failure":
             raise DomainError("PROVIDER_UNREACHABLE", "Simulated provider is unavailable", 503)
         if not self.rows(db, ctx):
@@ -69,6 +85,7 @@ class MockProvider:
         self.require("bookings_write")
         raise NotImplementedError
     def cancel_booking(self, db, ctx, reference):
+        """Mark the simulated booking cancelled; PROVIDER_RECORD_NOT_FOUND if missing."""
         self.require("bookings_cancel")
         row = next((r for r in self.rows(db, ctx, "reservation") if r.external_id == reference), None)
         if not row:
@@ -76,6 +93,7 @@ class MockProvider:
         row.data = {**row.data, "status": "cancelled"}
         return {"status": "cancelled", "external_id": reference}
     def modify_booking(self, db, ctx, reference, request):
+        """Move a booking if the provider still has availability (excluding itself); else PROVIDER_CONFLICT."""
         self.require("bookings_modify")
         decision = self.availability(db, ctx, request, exclude=reference)
         if decision["status"] != "AVAILABLE":
@@ -86,7 +104,9 @@ class MockProvider:
         row.data = {**row.data, **decision, "status": "confirmed"}
         return {"status": "confirmed", "external_id": reference, **decision}
     def create_order(self, db, ctx, quote, idempotency_key):
+        """Create an order idempotently keyed by idempotency_key; scenario 'ambiguous' reports pending_confirmation."""
         self.require("orders_write")
+        # Idempotency: replayed order key returns the original order.
         prior = next((r for r in self.rows(db, ctx, "order") if r.data.get("idempotency_key") == idempotency_key), None)
         if prior:
             return {"status": prior.data["state"], "external_id": prior.external_id}
@@ -97,6 +117,7 @@ class MockProvider:
 
 
 class MockOpenTableAdapter(MockProvider):
+    """Simulated booking system with verified seating arrangements (no POS or menu)."""
     provider = "mock_opentable"
     supported = ("configuration_read", "reservations_read", "availability_read", "bookings_write", "bookings_cancel", "bookings_modify")
     def seed(self, db, ctx):
@@ -123,11 +144,13 @@ class MockOpenTableAdapter(MockProvider):
         for unit in self.rows(db, ctx, "seating_unit"):
             if not unit.data["min_party"] <= request["party_size"] <= unit.data["max_party"] or not unit.data["verified_arrangement"]:
                 continue
+            # A unit is busy if another live booking overlaps [start, end) on the same unit.
             busy = any(r.external_id != exclude and r.data["status"] in ["confirmed", "pending_confirmation"] and r.data["unit_id"] == unit.external_id and utc(r.data["start_at"]) < end and utc(r.data["end_at"]) > start for r in self.rows(db, ctx, "reservation"))
             if not busy:
                 return {"status": "AVAILABLE", "start_at": start.isoformat(), "end_at": end.isoformat(), "unit_id": unit.external_id, "resources": [unit.data["name"]], "resource_ids": [], "party_size": request["party_size"], "reason_codes": []}
         return {"status": "NO_CAPACITY", "reason_codes": ["PROVIDER_NO_VERIFIED_ARRANGEMENT"]}
     def create_booking(self, db, ctx, request, idempotency_key):
+        # Idempotency: a replay with the same key returns the existing booking instead of creating another.
         prior = next((r for r in self.rows(db, ctx, "reservation") if r.data.get("idempotency_key") == idempotency_key), None)
         if prior:
             return {**prior.data, "external_id": prior.external_id, "status": "confirmed"}
@@ -139,6 +162,7 @@ class MockOpenTableAdapter(MockProvider):
 
 
 class MockToastAdapter(MockProvider):
+    """Simulated POS: tables, POS signals (hints only, never availability), menu and read-only orders."""
     provider = "mock_toast"
     supported = ("configuration_read", "tables_read", "pos_signals_read", "orders_read", "menu_read")
     def seed(self, db, ctx):
@@ -152,6 +176,7 @@ class MockToastAdapter(MockProvider):
 
 
 class MockSquareAdapter(MockProvider):
+    """Simulated ordering vendor: menu and order read/write, no tables or bookings."""
     provider = "mock_square"
     supported = ("configuration_read", "menu_read", "orders_read", "orders_write")
     def seed(self, db, ctx):
@@ -169,6 +194,7 @@ class InternalRestaurantAdapter:
     provider = "internal"
     capabilities = {key: "unsupported" if key == "pos_signals_read" else "supported" for key in CAPABILITIES}
     def location(self, db, ctx):
+        """Load the Location and enforce tenant ownership (NOT_FOUND otherwise)."""
         from .models import Location
         loc = db.get(Location, ctx.location_id)
         if not loc or loc.tenant_id != ctx.tenant_id:

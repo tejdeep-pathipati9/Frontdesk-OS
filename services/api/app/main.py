@@ -1,3 +1,14 @@
+"""FrontDesk OS HTTP API (FastAPI).
+
+All routes live here under /api/v1. FastAPI is the single authority for business
+logic: dashboard, Vapi webhook, LiveKit agent and Ollama chat all go through the
+same domain functions. Writes follow prepare -> confirm -> commit (atomic,
+idempotent, audited). Handlers authenticate via the `identity` dependency
+(session cookie), enforce roles with `require_role`, and scope every query to the
+caller's tenant via `get_location` / `owned`. Voice-provider routes use shared
+secrets (Vapi webhook secret, agent API token) instead of a session.
+"""
+
 import asyncio
 import hashlib
 import hmac
@@ -27,6 +38,7 @@ from .transcripts import start_retention, prune as prune_transcripts, retention_
 
 @asynccontextmanager
 async def lifespan(app):
+    """Validate live-mode secrets, create tables, then seed demo data (demo) or bootstrap the owner tenant/membership (live)."""
     cfg = settings()
     if not cfg.demo_mode and (len(cfg.session_secret) < 32 or cfg.session_secret.startswith("local-demo") or not cfg.owner_password):
         raise RuntimeError("Live mode requires a strong SESSION_SECRET and OWNER_PASSWORD")
@@ -48,13 +60,16 @@ request_windows = defaultdict(deque)
 
 @app.middleware("http")
 async def protect(request, call_next):
+    """HTTP middleware: reject cross-origin state changes, rate-limit per client IP, and add correlation-id/no-store headers."""
     correlation = secrets.token_hex(12)
     request.state.correlation_id = correlation
+    # Mutating requests carrying an Origin must match the configured web origin or this host (CSRF guard).
     origin = request.headers.get("origin")
     if request.method not in ["GET", "HEAD", "OPTIONS"] and origin:
         from urllib.parse import urlsplit
         if origin != settings().web_origin and urlsplit(origin).netloc != request.headers.get("host"):
             return JSONResponse({"code": "INVALID_ORIGIN", "message": "Cross-origin changes are disabled", "retryable": False, "correlation_id": correlation}, status_code=403)
+    # Sliding 60s window per (client, is-login); login is limited to 20/min, everything else 600/min.
     key = (request.client.host if request.client else "local", request.url.path == "/api/v1/auth/login")
     window = request_windows[key]
     current = time.monotonic()
@@ -72,15 +87,18 @@ async def protect(request, call_next):
 
 @app.exception_handler(DomainError)
 async def handle_domain(request, error):
+    """Render a DomainError as the standard JSON error envelope (code, message, retryable, correlation_id, optional decision)."""
     return JSONResponse({"code": error.code, "message": error.message, "retryable": error.retryable, "correlation_id": request.state.correlation_id, **({"decision": error.decision} if error.decision is not None else {})}, status_code=error.status)
 
 
 @app.exception_handler(RequestValidationError)
 async def handle_validation(request, error):
+    """Render request validation failures as a 422 with per-field messages."""
     return JSONResponse({"code": "VALIDATION_ERROR", "message": "Invalid request fields", "fields": [{"field": ".".join(map(str, e["loc"])), "message": e["msg"]} for e in error.errors()], "retryable": False, "correlation_id": request.state.correlation_id}, status_code=422)
 
 
 def get_location(db, location_id, user):
+    """Load a location and ensure it belongs to the caller's tenant; 404 otherwise."""
     loc = db.get(Location, location_id)
     if not loc or loc.tenant_id != user["tenant_id"]:
         raise DomainError("NOT_FOUND", "Location not found", 404)
@@ -88,14 +106,17 @@ def get_location(db, location_id, user):
 
 
 def owned(db, model, id_, user):
+    """Load any tenant-scoped row by id and ensure it belongs to the caller's tenant; 404 otherwise."""
     row = db.get(model, id_)
     if not row or row.tenant_id != user["tenant_id"]:
         raise DomainError("NOT_FOUND", "Record not found", 404)
     return row
 
 
+# ---- Health & auth ----
 @app.get("/api/v1/health")
 def health():
+    """Unauthenticated liveness check; verifies DB connectivity and reports demo mode and database provider."""
     with Session() as db:
         db.execute(select(1))
     from sqlalchemy.engine import make_url
@@ -107,6 +128,7 @@ def health():
 
 @app.post("/api/v1/auth/login")
 def login(body: s.Login, response: Response):
+    """Authenticate the owner (password or demo login) and set the signed httponly session cookie. Rate-limited by middleware."""
     cfg = settings()
     if body.demo:
         if not cfg.demo_mode or not cfg.allow_demo_login:
@@ -128,23 +150,30 @@ def login(body: s.Login, response: Response):
 
 @app.get("/api/v1/auth/me")
 def me(user=Depends(identity)):
-    return user
+    """Return the current session identity plus a display name."""
+    cfg = settings()
+    name = cfg.owner_name.strip() if user["email"] == cfg.owner_email else ""
+    return {**user, "display_name": name or user["email"].split("@")[0]}
 
 
 @app.post("/api/v1/auth/logout")
 def logout(response: Response):
+    """Clear the session cookie."""
     response.delete_cookie("frontdesk_session")
     return {"status": "signed_out"}
 
 
+# ---- Locations & settings ----
 @app.get("/api/v1/locations")
 def list_locations(user=Depends(identity)):
+    """List the tenant's locations (any authenticated role)."""
     with Session() as db:
         return [serialize(r) for r in db.scalars(select(Location).where(Location.tenant_id == user["tenant_id"]).order_by(Location.created_at))]
 
 
 @app.post("/api/v1/locations")
 def create_location(body: s.LocationCreate, user=Depends(identity)):
+    """Create a location with default settings (owner/manager). Restaurants also get kitchen state and optionally connect an existing provider. Emits location.created."""
     require_role(user)
     try:
         ZoneInfo(body.timezone)
@@ -168,12 +197,14 @@ def create_location(body: s.LocationCreate, user=Depends(identity)):
 
 @app.get("/api/v1/locations/{location_id}")
 def read_location(location_id: str, user=Depends(identity)):
+    """Return one location (tenant-scoped)."""
     with Session() as db:
         return serialize(get_location(db, location_id, user))
 
 
 @app.patch("/api/v1/locations/{location_id}")
 def patch_settings(location_id: str, body: s.SettingsPatch, user=Depends(identity)):
+    """Merge settings into a location (owner/manager), validating hours and table combinations; prunes transcripts if retention changed. Emits settings.updated."""
     require_role(user)
     with transaction() as db:
         loc = get_location(db, location_id, user)
@@ -196,11 +227,13 @@ def patch_settings(location_id: str, body: s.SettingsPatch, user=Depends(identit
 
 
 def scoped_list(db, model, loc):
+    """Return up to 500 newest rows of a model for a location, tenant-scoped."""
     return list(db.scalars(select(model).where(model.tenant_id == loc.tenant_id, model.location_id == loc.id).order_by(model.created_at.desc()).limit(500)))
 
 
 @app.get("/api/v1/locations/{location_id}/snapshot")
 def snapshot(location_id: str, user=Depends(identity)):
+    """Aggregate dashboard state for a location (resources, bookings, orders, kitchen, calls, events, integration health). Stylists get no bookings; calls only for owner/manager/host."""
     with Session() as db:
         loc = get_location(db, location_id, user)
         bookings = scoped_list(db, Reservation, loc)
@@ -224,8 +257,10 @@ def snapshot(location_id: str, user=Depends(identity)):
         return {"location": serialize(loc), "resources": [serialize(r) for r in resources(db, loc)], "services": [serialize(r) for r in scoped_list(db, Service, loc)], "menu": [serialize(r) for r in scoped_list(db, MenuItem, loc) if ids is None or r.id in ids], "reservations": [booking_dict(db, r) for r in bookings], "waitlist": [serialize(r) for r in scoped_list(db, WaitlistEntry, loc)], "orders": orders, "kitchen": serialize(kitchen) if kitchen else None, "calls": calls, "events": [serialize(r) for r in scoped_list(db, Event, loc)[:50]], "integration_health": [describe(db, loc, c) for c in connections], "as_of": now().isoformat()}
 
 
+# ---- Floor / tables ----
 @app.get("/api/v1/locations/{location_id}/tables")
 def list_tables(location_id: str, user=Depends(identity)):
+    """List a location's table resources."""
     with Session() as db:
         from .domain import resources
         return [serialize(r) for r in resources(db, get_location(db, location_id, user)) if r.kind == "table"]
@@ -233,6 +268,7 @@ def list_tables(location_id: str, user=Depends(identity)):
 
 @app.post("/api/v1/locations/{location_id}/tables/{table_id}/transitions")
 def table_transition(location_id: str, table_id: str, body: s.TableTransition, user=Depends(identity)):
+    """Move a table through the floor state machine (host+). Seating checks party fit and reservation overlap; clearing completes seated reservations. Emits table.transitioned."""
     require_role(user, "host")
     transitions = {"available": ["held", "seated", "cleaning", "out_of_service"], "held": ["available", "seated", "out_of_service"], "seated": ["cleaning", "out_of_service"], "cleaning": ["available", "out_of_service"], "out_of_service": ["available"]}
     with transaction() as db:
@@ -266,15 +302,18 @@ def table_transition(location_id: str, table_id: str, body: s.TableTransition, u
         return serialize(table)
 
 
+# ---- Availability, wait estimates & quotes ----
 @app.post("/api/v1/availability/restaurant")
 @app.post("/api/v1/availability/salon")
 def check_availability(body: s.Availability, user=Depends(identity)):
+    """Read-only availability search for a restaurant table or salon slot."""
     with Session() as db:
         return availability(db, get_location(db, body.location_id, user), body)
 
 
 @app.post("/api/v1/wait-estimates/seating")
 def wait_estimate(body: s.WaitlistCreate, user=Depends(identity)):
+    """Read-only seating wait estimate for a party size."""
     with Session() as db:
         return seating_wait(db, get_location(db, body.location_id, user), body.party_size)
 
@@ -282,12 +321,15 @@ def wait_estimate(body: s.WaitlistCreate, user=Depends(identity)):
 @app.post("/api/v1/orders/quote")
 @app.post("/api/v1/wait-estimates/takeout")
 def order_quote(body: s.QuoteRequest, user=Depends(identity)):
+    """Read-only takeout order quote / wait estimate."""
     with Session() as db:
         return quote(db, get_location(db, body.location_id, user), body)
 
 
+# ---- Actions: prepare / confirm / commit ----
 @app.post("/api/v1/actions/prepare")
 def prepare_action(body: s.PrepareAction, user=Depends(identity)):
+    """Step 1 of writes (host+): create a server-held pending action with a readback; nothing is committed."""
     require_role(user, "host")
     with transaction() as db:
         return prepare(db, get_location(db, body.location_id, user), body)
@@ -295,6 +337,7 @@ def prepare_action(body: s.PrepareAction, user=Depends(identity)):
 
 @app.post("/api/v1/actions/{action_id}/confirm")
 def confirm_action(action_id: str, user=Depends(identity)):
+    """Step 2 (host+): record staff confirmation of a pending action. Voice-originated actions are refused; they need customer transcript confirmation."""
     require_role(user, "host")
     with transaction() as db:
         action = owned(db, PendingAction, action_id, user)
@@ -310,15 +353,18 @@ def confirm_action(action_id: str, user=Depends(identity)):
 @app.post("/api/v1/orders")
 @app.post("/api/v1/appointments")
 def commit_action(body: s.CommitAction, user=Depends(identity)):
+    """Step 3 (host+): atomically commit a confirmed pending action (also serves the reservation/order/appointment create aliases)."""
     require_role(user, "host")
     with transaction() as db:
         action = owned(db, PendingAction, body.action_id, user)
         return commit(db, get_location(db, action.location_id, user), action)
 
 
+# ---- Reservations & appointments ----
 @app.get("/api/v1/reservations")
 @app.get("/api/v1/appointments")
 def list_reservations(location_id: str, user=Depends(identity)):
+    """List bookings (reservations or appointments) for a location."""
     with Session() as db:
         return [booking_dict(db, r) for r in scoped_list(db, Reservation, get_location(db, location_id, user))]
 
@@ -326,6 +372,7 @@ def list_reservations(location_id: str, user=Depends(identity)):
 @app.patch("/api/v1/reservations/{id_}")
 @app.patch("/api/v1/appointments/{id_}")
 def change_reservation(id_: str, body: s.StatusPatch, user=Depends(identity)):
+    """Change booking status (host+) within the allowed state machine; provider-mirrored bookings only support cancellation via the provider. Emits reservation.updated."""
     require_role(user, "host")
     allowed = {"confirmed": ["cancelled", "no_show", "completed"], "seated": ["completed"], "cancelled": [], "no_show": [], "completed": []}
     with transaction() as db:
@@ -347,6 +394,7 @@ def change_reservation(id_: str, body: s.StatusPatch, user=Depends(identity)):
 @app.post("/api/v1/reservations/{id_}/reschedule")
 @app.post("/api/v1/appointments/{id_}/reschedule")
 def reschedule(id_: str, body: s.Availability, user=Depends(identity)):
+    """Move a confirmed booking to a new slot (host+): re-runs availability, replaces allocations, or delegates to the provider. Emits reservation.rescheduled."""
     require_role(user, "host")
     with transaction() as db:
         row = owned(db, Reservation, id_, user)
@@ -372,14 +420,17 @@ def reschedule(id_: str, body: s.Availability, user=Depends(identity)):
         return booking_dict(db, row)
 
 
+# ---- Waitlist & kitchen state ----
 @app.get("/api/v1/waitlist")
 def list_waitlist(location_id: str, user=Depends(identity)):
+    """List waitlist entries for a location."""
     with Session() as db:
         return [serialize(r) for r in scoped_list(db, WaitlistEntry, get_location(db, location_id, user))]
 
 
 @app.post("/api/v1/waitlist")
 def join_waitlist(body: s.WaitlistCreate, user=Depends(identity)):
+    """Add a party to the waitlist with a computed wait estimate (host+). Emits waitlist.joined."""
     require_role(user, "host")
     with transaction() as db:
         loc = get_location(db, body.location_id, user)
@@ -393,6 +444,7 @@ def join_waitlist(body: s.WaitlistCreate, user=Depends(identity)):
 
 @app.patch("/api/v1/waitlist/{id_}")
 def change_waitlist(id_: str, body: s.StatusPatch, user=Depends(identity)):
+    """Mark a waiting entry removed or seated (host+). Emits waitlist.updated."""
     require_role(user, "host")
     with transaction() as db:
         row = owned(db, WaitlistEntry, id_, user)
@@ -406,6 +458,7 @@ def change_waitlist(id_: str, body: s.StatusPatch, user=Depends(identity)):
 
 @app.patch("/api/v1/locations/{location_id}/operational-state")
 def update_kitchen(location_id: str, body: s.KitchenPatch, user=Depends(identity)):
+    """Update kitchen operational state such as pause/prep time (kitchen+). Emits kitchen.updated."""
     require_role(user, "kitchen")
     with transaction() as db:
         loc = get_location(db, location_id, user)
@@ -421,11 +474,14 @@ def update_kitchen(location_id: str, body: s.KitchenPatch, user=Depends(identity
 
 @app.get("/api/v1/locations/{location_id}/operational-state")
 def operational_state(location_id: str, user=Depends(identity)):
+    """Alias of the location snapshot."""
     return snapshot(location_id, user)
 
 
+# ---- Menu, orders, resources & services ----
 @app.get("/api/v1/menu")
 def menu(location_id: str, user=Depends(identity)):
+    """List menu items visible in the location's active catalog."""
     with Session() as db:
         from .integration_service import catalog_ids
         loc = get_location(db, location_id, user)
@@ -435,6 +491,7 @@ def menu(location_id: str, user=Depends(identity)):
 
 @app.post("/api/v1/resources")
 def create_resource(body: s.ResourceCreate, user=Depends(identity)):
+    """Create a table (restaurant) or stylist (salon) resource (owner/manager); blocked when a floor provider manages tables."""
     require_role(user)
     with transaction() as db:
         loc = get_location(db, body.location_id, user)
@@ -451,6 +508,7 @@ def create_resource(body: s.ResourceCreate, user=Depends(identity)):
 
 @app.post("/api/v1/services")
 def create_service(body: s.ServiceCreate, user=Depends(identity)):
+    """Create a salon service with eligible staff (owner/manager). Emits service.created."""
     require_role(user)
     with transaction() as db:
         loc = get_location(db, body.location_id, user)
@@ -469,6 +527,7 @@ def create_service(body: s.ServiceCreate, user=Depends(identity)):
 
 @app.patch("/api/v1/services/{id_}")
 def patch_service(id_: str, body: s.ServicePatch, user=Depends(identity)):
+    """Enable/disable a service (owner/manager). Emits service.updated."""
     require_role(user)
     with transaction() as db:
         service = owned(db, Service, id_, user)
@@ -479,6 +538,7 @@ def patch_service(id_: str, body: s.ServicePatch, user=Depends(identity)):
 
 @app.patch("/api/v1/menu/{id_}")
 def update_menu(id_: str, body: dict, user=Depends(identity)):
+    """Toggle menu item availability (kitchen+); respects provider-driven projection. Emits menu.availability_changed."""
     require_role(user, "kitchen")
     if set(body) != {"available"} or not isinstance(body["available"], bool):
         raise DomainError("INVALID_ARGUMENTS", "Provide an available boolean", 422)
@@ -495,6 +555,7 @@ def update_menu(id_: str, body: dict, user=Depends(identity)):
 
 @app.patch("/api/v1/orders/{id_}")
 def change_order(id_: str, body: s.StatusPatch, user=Depends(identity)):
+    """Advance an order's state (kitchen+). Provider-managed orders are updated through the provider adapter with conflict checks."""
     require_role(user, "kitchen")
     transitions = {"accepted": ["preparing", "cancelled"], "preparing": ["ready", "cancelled"], "ready": ["picked_up", "cancelled"]}
     with transaction() as db:
@@ -521,6 +582,7 @@ def change_order(id_: str, body: s.StatusPatch, user=Depends(identity)):
 
 @app.patch("/api/v1/resources/{id_}")
 def change_resource(id_: str, body: s.ResourcePatch, user=Depends(identity)):
+    """Update a stylist's state, shift hours or blocked intervals (owner/manager); tables must use floor transitions. Emits staff.updated."""
     require_role(user)
     with transaction() as db:
         row = owned(db, Resource, id_, user)
@@ -547,8 +609,10 @@ def change_resource(id_: str, body: s.ResourcePatch, user=Depends(identity)):
         return serialize(row)
 
 
+# ---- Calls & audit ----
 @app.get("/api/v1/calls")
 def calls(location_id: str, q: str = "", outcome: str = "", limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0), user=Depends(identity)):
+    """Paginated, filterable call log without transcripts (host+)."""
     require_role(user, "host")
     with Session() as db:
         loc = get_location(db, location_id, user)
@@ -559,6 +623,7 @@ def calls(location_id: str, q: str = "", outcome: str = "", limit: int = Query(5
 
 @app.get("/api/v1/calls/{id_}")
 def call_detail(id_: str, user=Depends(identity)):
+    """Full call record (host+): tools, actions, linked bookings/orders, events and attention reviews."""
     require_role(user, "host")
     with Session() as db:
         row = owned(db, Call, id_, user)
@@ -579,13 +644,16 @@ def call_detail(id_: str, user=Depends(identity)):
 
 @app.get("/api/v1/audit-events")
 def audits(location_id: str, user=Depends(identity)):
+    """List audit events for a location (owner/manager)."""
     require_role(user)
     with Session() as db:
         return [serialize(r) for r in scoped_list(db, AuditEvent, get_location(db, location_id, user))]
 
 
+# ---- Integrations & booking authority ----
 @app.get("/api/v1/integrations")
 def integrations(location_id: str, user=Depends(identity)):
+    """List integration status (owner/manager): internal, Square, Toast and catalog; credentials only surface for demo locations."""
     require_role(user)
     with Session() as db:
         loc = get_location(db, location_id, user)
@@ -618,6 +686,7 @@ def integrations(location_id: str, user=Depends(identity)):
 
 @app.post("/api/v1/integrations/{provider}/connect")
 def connect_integration(provider: str, body: s.IntegrationConnect, user=Depends(identity)):
+    """Connect a provider and choose booking/order authority (owner/manager)."""
     require_role(user)
     from .integration_service import connect
     with transaction() as db:
@@ -627,6 +696,7 @@ def connect_integration(provider: str, body: s.IntegrationConnect, user=Depends(
 
 @app.post("/api/v1/integrations/{provider}/sync")
 def sync_integration(provider: str, location_id: str, user=Depends(identity)):
+    """Synchronize a connected provider's data and return its health (owner/manager)."""
     require_role(user)
     from .integration_service import connection, sync, describe
     with transaction() as db:
@@ -643,6 +713,7 @@ from .integration_normalization import Envelope as MockIntegrationEvent
 
 @app.post("/api/v1/integrations/{provider}/mock-events")
 def ingest_mock_event(provider: str, body: MockIntegrationEvent, user=Depends(identity)):
+    """Ingest a simulated provider event (demo locations only, owner/manager); idempotent per event id, ignores older/future timestamps."""
     require_role(user)
     from .integration_service import require_adapter, context, apply_record
     from .integration_normalization import normalize
@@ -675,6 +746,7 @@ def ingest_mock_event(provider: str, body: MockIntegrationEvent, user=Depends(id
 
 @app.post("/api/v1/integrations/{provider}/disconnect")
 def disconnect_integration(provider: str, location_id: str, user=Depends(identity)):
+    """Disconnect a provider, reverting authorities to internal (owner/manager). Emits integration.disconnected."""
     require_role(user)
     from .integration_service import connection, choose_authority
     with transaction() as db:
@@ -693,6 +765,7 @@ def disconnect_integration(provider: str, location_id: str, user=Depends(identit
 
 @app.post("/api/v1/locations/{location_id}/booking-authority")
 def set_booking_authority(location_id: str, body: s.AuthoritySelection, user=Depends(identity)):
+    """Choose which system is authoritative for bookings and orders (owner/manager)."""
     require_role(user)
     from .integration_service import require_adapter, choose_authority
     with transaction() as db:
@@ -708,6 +781,7 @@ def set_booking_authority(location_id: str, body: s.AuthoritySelection, user=Dep
 
 @app.post("/api/v1/capacity-requests")
 def staff_booking_request(body: s.StaffBookingRequest, user=Depends(identity)):
+    """Create a staff review request for a capacity/seating decision (host+)."""
     require_role(user, "host")
     from .integration_service import request_staff_review
     with transaction() as db:
@@ -716,6 +790,7 @@ def staff_booking_request(body: s.StaffBookingRequest, user=Depends(identity)):
 
 @app.post("/api/v1/capacity-requests/{id_}/arrangement")
 def verify_arrangement(id_: str, body: s.SeatingArrangementReview, user=Depends(identity)):
+    """Staff verifies a table arrangement for a capacity review request (host+); saves combinations but does not confirm a booking."""
     require_role(user, "host")
     with transaction() as db:
         event = owned(db, Event, id_, user)
@@ -734,6 +809,7 @@ def verify_arrangement(id_: str, body: s.SeatingArrangementReview, user=Depends(
 
 
 def integration_configuration_ref(provider):
+    """Return an HMAC fingerprint of provider credentials so cached test results go stale when configuration changes."""
     """Invalidate cached health when credentials or account configuration change."""
     cfg = settings()
     fields = [cfg.square_access_token, cfg.square_location_id, cfg.square_environment, cfg.square_api_version] if provider == "square" else [cfg.toast_client_id, cfg.toast_client_secret, cfg.toast_restaurant_guid, cfg.toast_api_url]
@@ -742,6 +818,7 @@ def integration_configuration_ref(provider):
 
 @app.post("/api/v1/integrations/{provider}/test")
 def test_integration(provider: str, location_id: str, user=Depends(identity)):
+    """Run a live Square/Toast connectivity probe (owner/manager, demo tenant only) and record integration.tested."""
     require_role(user)
     with Session() as db:
         get_location(db, location_id, user)
@@ -755,8 +832,10 @@ def test_integration(provider: str, location_id: str, user=Depends(identity)):
     return {**result, "last_tested_at": now().isoformat()}
 
 
+# ---- Voice: config, test calls, Vapi webhook ----
 @app.get("/api/v1/voice/config")
 def voice_config(location_id: str, user=Depends(identity)):
+    """Return voice provider configuration, tool list and agent prompt; secrets and ids only for demo locations."""
     with Session() as db:
         loc = get_location(db, location_id, user)
     cfg = settings()
@@ -767,6 +846,7 @@ def voice_config(location_id: str, user=Depends(identity)):
 
 @app.post("/api/v1/voice/vapi/readiness")
 def vapi_readiness(body: s.VoiceSession, user=Depends(identity)):
+    """Check the Vapi webhook is reachable (host+); creates no call or action."""
     require_role(user, "host")
     with Session() as db:
         loc = get_location(db, body.location_id, user)
@@ -777,11 +857,14 @@ def vapi_readiness(body: s.VoiceSession, user=Depends(identity)):
     from .voice_readiness import check_webhook
     # Network I/O is outside the database transaction; this creates no call/action.
     result = check_webhook(cfg.vapi_server_url, cfg.vapi_webhook_secret)
+    from .confirmation_intent import request_warm
+    request_warm()
     return {**result, "connection_id": hashlib.sha256(f"{cfg.vapi_server_url}|{assistant}".encode()).hexdigest()[:16]}
 
 
 @app.post("/api/v1/voice/test-calls")
 def start_test_call(body: dict, user=Depends(identity)):
+    """Create a no-audio tool-test call (host+)."""
     require_role(user, "host")
     with transaction() as db:
         loc = get_location(db, body.get("location_id"), user)
@@ -793,6 +876,7 @@ def start_test_call(body: dict, user=Depends(identity)):
 
 @app.post("/api/v1/voice/test-calls/{id_}/tools")
 def test_tool(id_: str, body: s.ToolRequest, user=Depends(identity)):
+    """Execute an agent tool against a tool-test call (host+)."""
     require_role(user, "host")
     with transaction() as db:
         call = owned(db, Call, id_, user)
@@ -803,6 +887,7 @@ def test_tool(id_: str, body: s.ToolRequest, user=Depends(identity)):
 
 @app.post("/api/v1/voice/test-calls/{id_}/confirm")
 def confirm_test_call(id_: str, body: s.CommitAction, user=Depends(identity)):
+    """Staff confirm a tool-test call's pending action (host+)."""
     require_role(user, "host")
     with transaction() as db:
         call = owned(db, Call, id_, user)
@@ -814,6 +899,7 @@ def confirm_test_call(id_: str, body: s.CommitAction, user=Depends(identity)):
 
 
 def end_call(db, call):
+    """Finalize a call: set status/outcome/summary, abandon unconfirmed actions and prune transcripts. Shared by all voice paths."""
     call.status, call.ended_at = "ended", now()
     actions = list(db.scalars(select(PendingAction).where(PendingAction.call_id == call.id, PendingAction.tenant_id == call.tenant_id)))
     uncertain = any(a.state == 'pending_confirmation' for a in actions)
@@ -840,6 +926,7 @@ def end_call(db, call):
 
 @app.post("/api/v1/voice/test-calls/{id_}/end")
 def end_test_call(id_: str, user=Depends(identity)):
+    """End a tool-test call."""
     with transaction() as db:
         call = owned(db, Call, id_, user)
         if call.provider != "tool_test":
@@ -850,6 +937,8 @@ def end_test_call(id_: str, user=Depends(identity)):
 
 @app.post("/api/v1/voice/vapi")
 def vapi_webhook(body: dict, request: Request):
+    """Vapi server webhook: authenticates by bearer secret, maps assistant to location, runs tools and records call events."""
+    # Webhook auth: shared secret in the Authorization bearer header (constant-time compare).
     supplied = request.headers.get("authorization", "").removeprefix("Bearer ")
     if not secret_matches(supplied, settings().vapi_webhook_secret):
         raise DomainError("UNAUTHENTICATED_WEBHOOK", "Webhook credential missing or invalid", 401)
@@ -857,9 +946,13 @@ def vapi_webhook(body: dict, request: Request):
     provider_call = message.get("call", {})
     assistant = provider_call.get("assistantId") or message.get("assistant", {}).get("id")
     cfg = settings()
+    # Only assistants configured in env are accepted; each maps to a fixed demo location (never client-supplied).
     mapping = {id_: loc for id_, loc in [(cfg.vapi_restaurant_assistant_id, RESTAURANT), (cfg.vapi_salon_assistant_id, SALON)] if id_}
     if assistant not in mapping or not provider_call.get("id"):
         raise DomainError("UNKNOWN_ASSISTANT", "Assistant is not mapped to an authorized location", 403)
+    if (message.get("type") == "status-update" and message.get("status") == "in-progress") or (message.get("type") == "tool-calls" and any(item.get("function", {}).get("name") == "prepare_action" for item in message.get("toolCallList", []))):
+        from .confirmation_intent import request_warm
+        request_warm()
     if message.get("type") == "tool-calls":
         # Transcript webhooks and tool requests can arrive out of order. Give a
         # delayed final transcript a short chance to arrive, WITHOUT holding the
@@ -904,10 +997,12 @@ def vapi_webhook(body: dict, request: Request):
             db.add(call)
             db.flush()
             start_retention(db, call, loc)
+        # Dedupe key: Vapi message id (or a hash of the payload) scoped to the call; replays are recorded as events.
         type_ = message.get("type", "unknown")
         source_id = message.get("id") or hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest()
         source_id = f"{call.provider_call_id}:{source_id}"
         replayed = db.scalar(select(Event.id).where(Event.source == "vapi", Event.source_event_id == source_id))
+        # Event dispatch: tool-calls return results synchronously; other types are idempotent via the Event source key.
         if type_ == "tool-calls":
             results = []
             for item in message.get("toolCallList", []):
@@ -927,6 +1022,7 @@ def vapi_webhook(body: dict, request: Request):
             return {"results": results}
         if replayed:
             return {"status": "already_processed"}
+        # Dispatch: interruption invalidates readbacks; final transcripts feed confirmation detection; end reports end the call.
         if type_ == "user-interrupted":
             for action in db.scalars(select(PendingAction).where(PendingAction.call_id == call.id, PendingAction.tenant_id == loc.tenant_id, PendingAction.state == "awaiting_confirmation")):
                 interrupt_readback(action)
@@ -938,11 +1034,15 @@ def vapi_webhook(body: dict, request: Request):
         return {"status": "processed"}
 
 
+# ---- Realtime (SSE) ----
 @app.get("/api/v1/realtime")
 async def realtime(location_id: str, request: Request, user=Depends(identity)):
+    """Server-sent events stream announcing the latest event id for a location so clients refetch state."""
     with Session() as db:
         get_location(db, location_id, user)
+    # SSE: poll the newest Event id each second; emit only on change, else a heartbeat comment to keep proxies open.
     async def stream():
+        """Yield an SSE state event when the newest event id changes, otherwise a heartbeat, once per second."""
         last = object()  # Send initial state even for a newly created location.
         while not await request.is_disconnected():
             with Session() as db:
@@ -957,8 +1057,10 @@ async def realtime(location_id: str, request: Request, user=Depends(identity)):
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store, no-transform"})
 
 
+# ---- Voice: LiveKit & agent ----
 @app.post("/api/v1/voice/livekit/session")
 def livekit_session(body: s.VoiceSession, user=Depends(identity)):
+    """Start a LiveKit web call (host+): create call, retention and a short-lived room token that dispatches the agent."""
     require_role(user, "host")
     cfg = settings()
     if not all([cfg.livekit_url, cfg.livekit_api_key, cfg.livekit_api_secret, cfg.agent_api_token]):
@@ -980,6 +1082,7 @@ def livekit_session(body: s.VoiceSession, user=Depends(identity)):
 
 
 def agent_call(db, id_, request):
+    """Authenticate the LiveKit agent token and return its authorized LiveKit call."""
     supplied = request.headers.get("authorization", "").removeprefix("Bearer ")
     if not secret_matches(supplied, settings().agent_api_token):
         raise DomainError("UNAUTHENTICATED_AGENT", "Agent credential is invalid", 401)
@@ -991,6 +1094,7 @@ def agent_call(db, id_, request):
 
 @app.get("/api/v1/voice/agent/calls/{id_}")
 def read_agent_call(id_: str, request: Request):
+    """Agent bootstrap: prompt, tools and transcript notice for a call."""
     with Session() as db:
         call = agent_call(db, id_, request)
         notice = "This call is transcribed for service review. You can ask me not to save the transcript." if call.transcript_status == 'retained' else ""
@@ -999,6 +1103,7 @@ def read_agent_call(id_: str, request: Request):
 
 @app.post("/api/v1/voice/agent/calls/{id_}/tools")
 def agent_tool(id_: str, body: s.ToolRequest, request: Request):
+    """Agent tool execution; commit_action first resolves the customer's spoken confirmation."""
     if body.name == "commit_action":
         with Session() as db:
             agent_call(db, id_, request)
@@ -1010,6 +1115,7 @@ def agent_tool(id_: str, body: s.ToolRequest, request: Request):
 
 @app.post("/api/v1/voice/agent/calls/{id_}/transcript")
 def agent_transcript(id_: str, body: s.TranscriptEvent, request: Request):
+    """Ingest an agent transcript turn idempotently; interruptions invalidate pending readbacks."""
     with transaction() as db:
         call = agent_call(db, id_, request)
         key = f"{call.id}:{body.event_id}"
@@ -1028,6 +1134,7 @@ def agent_transcript(id_: str, body: s.TranscriptEvent, request: Request):
 
 @app.post("/api/v1/voice/agent/calls/{id_}/end")
 def agent_end(id_: str, request: Request):
+    """Agent signals call end. Emits call.ended."""
     with transaction() as db:
         call = agent_call(db, id_, request)
         end_call(db, call)
@@ -1035,8 +1142,10 @@ def agent_end(id_: str, request: Request):
         return {"status": "ended"}
 
 
+# ---- Voice: Ollama text chat ----
 @app.post("/api/v1/voice/ollama/session")
 def ollama_session(body: s.VoiceSession, user=Depends(identity)):
+    """Start an Ollama text-chat test call (host+)."""
     require_role(user, "host")
     with transaction() as db:
         loc = get_location(db, body.location_id, user)
@@ -1049,6 +1158,7 @@ def ollama_session(body: s.VoiceSession, user=Depends(identity)):
 
 @app.post("/api/v1/voice/ollama/{id_}/chat")
 def ollama_turn(id_: str, body: s.ChatTurn, user=Depends(identity)):
+    """Send one user turn to the local Ollama agent (host+)."""
     require_role(user, "host")
     with Session() as db:
         call = owned(db, Call, id_, user)
@@ -1060,6 +1170,7 @@ def ollama_turn(id_: str, body: s.ChatTurn, user=Depends(identity)):
 
 @app.post("/api/v1/voice/ollama/{id_}/end")
 def end_ollama(id_: str, user=Depends(identity)):
+    """End an Ollama text session and drop its chat history (host+)."""
     require_role(user, "host")
     with transaction() as db:
         call = owned(db, Call, id_, user)
@@ -1072,8 +1183,10 @@ def end_ollama(id_: str, user=Depends(identity)):
     return {"status": "ended"}
 
 
+# ---- Customers ----
 @app.get("/api/v1/customers")
 def customers(location_id: str, user=Depends(identity)):
+    """List customers with bookings/orders at a location, phone masked (host+)."""
     require_role(user, "host")
     with Session() as db:
         loc = get_location(db, location_id, user)
@@ -1090,6 +1203,7 @@ def customers(location_id: str, user=Depends(identity)):
 
 @app.patch("/api/v1/customers/{id_}")
 def update_customer(id_: str, body: s.CustomerPatch, user=Depends(identity)):
+    """Edit a customer's name/phone (host+). Emits customer.updated per location."""
     require_role(user, "host")
     with transaction() as db:
         row = owned(db, Customer, id_, user)
@@ -1102,13 +1216,16 @@ def update_customer(id_: str, body: s.CustomerPatch, user=Depends(identity)):
         return {"id": row.id, "display_name": row.display_name, "phone_masked": f"•••• {row.phone[-4:]}" if row.phone else "Not provided"}
 
 
+# ---- Attention queue ----
 @app.get("/api/v1/attention")
 def attention_queue(location_id: str, user=Depends(identity)):
+    """Build the staff attention queue (host+) from stale tables, failed tools, review events and pending approvals."""
     require_role(user, "host")
     from .domain import resources, table_needs_verification
     with Session() as db:
         loc = get_location(db, location_id, user)
         resolved = set(db.scalars(select(AuditEvent.target_id).where(AuditEvent.tenant_id == loc.tenant_id, AuditEvent.location_id == loc.id, AuditEvent.action == "attention.reviewed")))
+        # Queue items are built from five sources: stale tables, failed tools, review events, call/integration follow-ups, pending approvals; already reviewed targets are skipped.
         result = []
         for row in resources(db, loc):
             if row.kind == "table" and table_needs_verification(loc, row):
@@ -1131,11 +1248,15 @@ def attention_queue(location_id: str, user=Depends(identity)):
                 if call and call.status != "in_progress":
                     continue
                 result.append({"id": f"action:{row.id}", "kind": "pending_approval", "title": row.kind.replace("_", " ").capitalize(), "description": row.readback, "created_at": utc(row.created_at).isoformat(), "source": "voice_agent" if call else "staff_update", "call_id": row.call_id, "can_approve": not call or row.confirmed_at is not None, "can_reject": True, "confirmation_required": bool(call and not row.confirmed_at), "expires_at": utc(row.expires_at).isoformat()})
-        return sorted(result, key=lambda item: item["created_at"], reverse=True)
+        # Collapse multiple items from the same call into grouped follow-ups.
+        from .attention import group_call_followups
+        return group_call_followups(result)
 
 
+# ---- Assistant ----
 @app.get('/api/v1/assistant/summary')
 def assistant_summary(location_id: str, user=Depends(identity)):
+    """Assistant summary of the location and its attention queue (host+)."""
     require_role(user, 'host')
     from .assistant import summary
     queue = attention_queue(location_id, user)
@@ -1145,6 +1266,7 @@ def assistant_summary(location_id: str, user=Depends(identity)):
 
 @app.post('/api/v1/assistant/query')
 def assistant_query(body: s.AssistantQuery, user=Depends(identity)):
+    """Answer a staff question; the model only plans, numbers come from server data (host+)."""
     require_role(user, 'host')
     from .assistant import interpret, answer
     # Authorize BEFORE contacting the model. Its output never controls a tenant,
@@ -1159,8 +1281,10 @@ def assistant_query(body: s.AssistantQuery, user=Depends(identity)):
     return {**result, 'engine': engine}
 
 
+# ---- Attention decisions ----
 @app.post("/api/v1/attention/{target_id}/decision")
 def review_attention(target_id: str, body: s.AttentionDecision, user=Depends(identity)):
+    """Approve or reject an attention item (host+), committing/rejecting pending actions and resolving related follow-ups. Emits attention.reviewed."""
     require_role(user, "host")
     kind, _, record_id = target_id.partition(":")
     with transaction() as db:
@@ -1190,5 +1314,11 @@ def review_attention(target_id: str, body: s.AttentionDecision, user=Depends(ide
                 raise DomainError("INVALID_REVIEW", "Approve or reject the proposal", 422)
         elif body.decision == "approve":
             raise DomainError("NO_PENDING_TRANSACTION", "Use a new manual booking to complete this request", 422)
-        emit(db, loc, "attention.reviewed", {"decision": body.decision, "target": target_id}, user["id"], target_id)
+        targets = {target_id}
+        followup_call = row.call_id if kind == "tool" else row.payload.get("call_id") if kind == "event" and row.type == "call.escalation_requested" else None
+        if followup_call:
+            targets.update(f"tool:{tool.id}" for tool in scoped_list(db, ToolExecution, loc) if tool.call_id == followup_call and tool.status == "failed")
+            targets.update(f"event:{event.id}" for event in scoped_list(db, Event, loc) if event.type == "call.escalation_requested" and event.payload.get("call_id") == followup_call)
+        for target in sorted(targets):
+            emit(db, loc, "attention.reviewed", {"decision": body.decision, "target": target, "group": target_id}, user["id"], target)
         return result

@@ -1,4 +1,10 @@
-"""Persistent tenant-owned operational records. All times are stored in UTC."""
+"""Persistent tenant-owned operational records. All times are stored in UTC.
+
+SQLAlchemy 2.0 declarative models for every table. Every row except Tenant carries
+`tenant_id` (via `Owned`) and business logic must always filter on it. `Base.metadata`
+is the schema source for Alembic and `local_schema.migrate_sqlite`. Free-form policy
+and provider state lives in JSON columns (`Location.settings`, `Resource.attributes`).
+"""
 from datetime import datetime, timezone
 from uuid import uuid4
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint, Index
@@ -14,30 +20,36 @@ def uid():
 
 
 class Base(DeclarativeBase):
+    """Declarative base; its metadata is what Alembic/local_schema compare against."""
     pass
 
 
 class Record:
+    """Mixin: string UUID primary key and UTC created_at."""
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=uid)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class Owned(Record):
+    """Mixin: Record plus tenant_id; all tenant-scoped tables use this."""
     tenant_id: Mapped[str] = mapped_column(String(64), index=True)
 
 
 class Tenant(Record, Base):
+    """Top-level account; owns locations and members."""
     __tablename__ = "tenants"
     name: Mapped[str] = mapped_column(String(120))
 
 
 class Membership(Owned, Base):
+    """Staff login identity for a tenant; `role` drives auth.require_role (owner/manager/...)."""
     __tablename__ = "memberships"
     email: Mapped[str] = mapped_column(String(200))
     role: Mapped[str] = mapped_column(String(30))
 
 
 class Location(Owned, Base):
+    """A restaurant or salon; `settings` JSON holds hours, turn/cleaning times, providers, AI-action toggles."""
     __tablename__ = "locations"
     name: Mapped[str] = mapped_column(String(120))
     vertical: Mapped[str] = mapped_column(String(20))
@@ -48,6 +60,7 @@ class Location(Owned, Base):
 
 
 class Resource(Owned, Base):
+    """Bookable unit: restaurant table (live floor `state`, `verified_at`) or salon stylist (shift/blocks in `attributes`)."""
     __tablename__ = "resources"
     location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)
     name: Mapped[str] = mapped_column(String(100))
@@ -61,6 +74,7 @@ class Resource(Owned, Base):
 
 
 class Service(Owned, Base):
+    """Salon service; duration plus buffer define the booked window, `eligible_staff` lists stylist resource ids."""
     __tablename__ = "services"
     location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)
     name: Mapped[str] = mapped_column(String(100))
@@ -72,12 +86,14 @@ class Service(Owned, Base):
 
 
 class Customer(Owned, Base):
+    """Guest/caller contact record (normalized E.164 phone or empty)."""
     __tablename__ = "customers"
     display_name: Mapped[str] = mapped_column(String(100))
     phone: Mapped[str] = mapped_column(String(30), default="")
 
 
 class Reservation(Owned, Base):
+    """Table reservation or salon appointment; unique (location, idempotency_key); times are the allocated window."""
     __tablename__ = "reservations"
     __table_args__ = (UniqueConstraint("location_id", "idempotency_key"), Index("ix_reservation_interval", "location_id", "start_at", "end_at", "status"))
     location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)
@@ -95,6 +111,7 @@ class Reservation(Owned, Base):
 
 
 class Allocation(Owned, Base):
+    """Resource held by a reservation for [start_at, end_at); conflict checks run against these rows."""
     __tablename__ = "reservation_resources"
     reservation_id: Mapped[str] = mapped_column(ForeignKey("reservations.id"), index=True)
     resource_id: Mapped[str] = mapped_column(ForeignKey("resources.id"), index=True)
@@ -103,6 +120,7 @@ class Allocation(Owned, Base):
 
 
 class WaitlistEntry(Owned, Base):
+    """Restaurant walk-in/phone waitlist entry with a quoted wait range."""
     __tablename__ = "waitlist_entries"
     location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)
     name: Mapped[str] = mapped_column(String(100))
@@ -113,6 +131,7 @@ class WaitlistEntry(Owned, Base):
 
 
 class MenuItem(Owned, Base):
+    """Takeout menu item; price in minor units, `work_units` consume kitchen bucket capacity."""
     __tablename__ = "menu_items"
     location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)
     name: Mapped[str] = mapped_column(String(100))
@@ -125,6 +144,7 @@ class MenuItem(Owned, Base):
 
 
 class KitchenState(Owned, Base):
+    """Staff-verified kitchen switches and per-15-minute-bucket work capacity (one row per location)."""
     __tablename__ = "kitchen_state"
     location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), unique=True)
     kitchen_open: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -136,6 +156,7 @@ class KitchenState(Owned, Base):
 
 
 class Order(Owned, Base):
+    """Takeout order accepted into a pickup bucket; unique (location, idempotency_key)."""
     __tablename__ = "orders"
     __table_args__ = (UniqueConstraint("location_id", "idempotency_key"),)
     location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)
@@ -154,6 +175,7 @@ class Order(Owned, Base):
 
 
 class Call(Owned, Base):
+    """A voice/text session; holds transcript (subject to retention), outcome and intent."""
     __tablename__ = "calls"
     __table_args__ = (UniqueConstraint("provider", "provider_call_id"),)
     location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)
@@ -171,6 +193,7 @@ class Call(Owned, Base):
 
 
 class PendingAction(Owned, Base):
+    """Server-held prepared proposal awaiting confirmation; commit requires confirmed_at and an unexpired state."""
     __tablename__ = "pending_actions"
     location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)
     call_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
@@ -185,6 +208,7 @@ class PendingAction(Owned, Base):
 
 
 class Event(Owned, Base):
+    """Operational event feed (drives dashboard/SSE); unique per (source, source_event_id) for idempotent ingest."""
     __tablename__ = "operational_events"
     __table_args__ = (UniqueConstraint("source", "source_event_id"),)
     location_id: Mapped[str] = mapped_column(String(64), index=True)
@@ -197,6 +221,7 @@ class Event(Owned, Base):
 
 
 class ToolExecution(Owned, Base):
+    """Log of an agent tool call, unique per (call, request_id) so retries replay the stored result."""
     __tablename__ = "tool_executions"
     __table_args__ = (UniqueConstraint("call_id", "request_id"),)
     call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), index=True)
@@ -211,6 +236,7 @@ class ToolExecution(Owned, Base):
 
 
 class AuditEvent(Owned, Base):
+    """Append-only audit trail of who did what to which record."""
     __tablename__ = "audit_events"
     location_id: Mapped[str] = mapped_column(String(64), index=True)
     actor: Mapped[str] = mapped_column(String(100))
@@ -221,6 +247,7 @@ class AuditEvent(Owned, Base):
 
 
 class IntegrationConnection(Owned, Base):
+    """Per-location provider connection (mode, sync status, capabilities)."""
     __tablename__ = "integration_connections"
     __table_args__ = (UniqueConstraint("location_id", "provider"),)
     location_id: Mapped[str] = mapped_column(ForeignKey("locations.id"), index=True)

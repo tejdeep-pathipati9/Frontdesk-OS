@@ -1,3 +1,4 @@
+"""LiveKit agent token and call-handling endpoints."""
 import jwt
 from sqlalchemy import select
 from app.config import settings

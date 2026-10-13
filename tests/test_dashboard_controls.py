@@ -1,3 +1,4 @@
+"""Staff dashboard control endpoints (floor, kitchen, settings)."""
 from datetime import timedelta
 from sqlalchemy import select
 from app.auth import token_for

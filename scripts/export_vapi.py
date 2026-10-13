@@ -1,4 +1,11 @@
-"""Generate a credential-free configuration draft; never contacts Vapi."""
+"""Generate a credential-free configuration draft; never contacts Vapi.
+
+Usage: python scripts/export_vapi.py --server-url HTTPS_URL --credential-id ID
+           [--vertical restaurant|salon] [--output PATH]
+Flags: --output defaults to .runtime/vapi-assistant.template.json.
+Touches: services/api app.tools (TOOLS, AGENT_PROMPT).
+Side effects: writes the draft JSON file only; also imported by setup_vapi.py.
+"""
 import argparse
 import json
 from pathlib import Path
@@ -7,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services/api"))
 from app.tools import TOOLS, AGENT_PROMPT
 
 def assistant_config(server_url, credential_id, vertical="restaurant", timezone=None, transcript_retention_calls=0):
+    """Build the Vapi assistant payload for a vertical; validates that server_url is a bare HTTPS origin."""
     from urllib.parse import urlsplit
     url = urlsplit(server_url)
     if url.scheme != "https" or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ["", "/"]:
@@ -20,18 +28,25 @@ def assistant_config(server_url, credential_id, vertical="restaurant", timezone=
     tools = [definition for definition in TOOLS if restaurant or definition["name"] not in ["get_wait_estimate", "check_order_capacity", "join_waitlist", "get_order_status"]]
     return {
         "name": "FrontDesk OS · Momentuum Bistro" if restaurant else "FrontDesk OS · Salon",
-        "firstMessage": "Hello, I'm the automated front desk assistant. " + ("This call is transcribed for service review. You can ask me not to save it. " if transcript_retention_calls else "") + "How can I help you today?",
+        "firstMessage": ("Hi, thanks for calling Momentuum Bistro. I'm your automated receptionist. " if restaurant else "Hi, I'm your salon's automated receptionist. ") + ("We save a transcript for service review; let me know if you'd prefer we don't. " if transcript_retention_calls else "") + "How can I help?",
         "server": {"url": server_url.rstrip("/") + "/api/v1/voice/vapi", "credentialId": credential_id, "timeoutSeconds": 20},
         "serverMessages": ["status-update", "transcript", "tool-calls", "end-of-call-report", "user-interrupted"],
         "artifactPlan": {"recordingEnabled": False, "videoRecordingEnabled": False, "pcapEnabled": False, "loggingEnabled": False, "transcriptPlan": {"enabled": False}},
         "maxDurationSeconds": 600,
         "backgroundSound": "off",
-        "startSpeakingPlan": {"waitSeconds": 0.6},
+        "startSpeakingPlan": {
+            "waitSeconds": 0.5,
+            "transcriptionEndpointingPlan": {"onPunctuationSeconds": 0.7, "onNoPunctuationSeconds": 1.5, "onNumberSeconds": 1.8},
+            # Phone numbers are commonly spoken as three separate groups.
+            # This rule overrides punctuation detection during that question.
+            "customEndpointingRules": [{"type": "assistant", "regex": "(?:phone|contact) number|number (?:should|can) (?:I|we)", "regexOptions": [{"type": "ignore-case", "enabled": True}], "timeoutSeconds": 2.0}],
+        },
         "model": {"provider": "openai", "model": "gpt-4.1-mini", "temperature": 0.1, "messages": [{"role": "system", "content": context + f"This is a {vertical} business. " + AGENT_PROMPT}], "tools": [{"type": "function", "async": False, "messages": [{"type": "request-start", "content": ""}], "function": definition} for definition in tools]},
     }
 
 
 def main():
+    """CLI entry point: write the credential-free draft to --output."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--server-url", required=True)
     parser.add_argument("--credential-id", required=True)

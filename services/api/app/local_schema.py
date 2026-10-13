@@ -1,4 +1,9 @@
-"""Adopt or migrate SQLite safely, without recreating an existing workspace."""
+"""Adopt or migrate SQLite safely, without recreating an existing workspace.
+
+Called from `db.init_db()`. Pre-Alembic databases are compared against the models and
+stamped at head only if identical; otherwise startup fails rather than guessing.
+Backups go to `.runtime/backups/` before any adoption or upgrade.
+"""
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
@@ -14,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def backup_sqlite(engine, directory=None):
+    """Online-copy the SQLite file to a timestamped 0600 backup; returns its path, or None for missing/in-memory DBs."""
     filename = engine.url.database
     if not filename or filename == ":memory:" or not Path(filename).exists():
         return None
@@ -28,6 +34,10 @@ def backup_sqlite(engine, directory=None):
 
 
 def migrate_sqlite(engine):
+    """Upgrade the SQLite schema to Alembic head, adopting an unversioned legacy schema when it matches the models.
+
+    Raises RuntimeError on a schema mismatch (before or after migrating) and ValueError for non-SQLite engines.
+    """
     if engine.dialect.name != "sqlite":
         raise ValueError("Local schema adoption only applies to SQLite")
     config = Config(str(ROOT / "services/api/alembic.ini"))
@@ -38,6 +48,7 @@ def migrate_sqlite(engine):
         adopt = bool(tables - {"alembic_version"}) and current is None
         if adopt and compare_metadata(MigrationContext.configure(connection), Base.metadata):
             raise RuntimeError("Existing SQLite schema does not match the application. No migration marker was written; review it before migration.")
+    # Back up before any change (adoption or pending upgrade).
     if current not in heads or adopt:
         backup_sqlite(engine)
     with engine.begin() as connection:

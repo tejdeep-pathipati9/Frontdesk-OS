@@ -1,5 +1,12 @@
 """Configure saved Vapi assistants using keys from the ignored local .env.
 
+Usage: python scripts/setup_vapi.py --server-url HTTPS_URL
+           [--vertical restaurant|salon|both] [--apply]
+Flags: --apply  create/update the saved assistant and webhook credential; without it
+               the run only verifies that local keys exist.
+Touches: the Vapi API (with --apply), .env (assistant/credential IDs via set_key) and
+draft payload files written with export_vapi.assistant_config.
+
 Does not place calls, purchase numbers, or print keys/provider payloads.
 """
 import argparse
@@ -16,6 +23,7 @@ ENV = ROOT / ".env"
 
 
 def main():
+    """CLI entry point: verify local keys and, with --apply, create/update Vapi resources."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--server-url", required=True)
     parser.add_argument("--vertical", choices=["restaurant", "salon", "both"], default="restaurant")
@@ -98,6 +106,8 @@ def main():
             model = verified.get("model", {})
             if model.get("messages") != payload["model"]["messages"] or model.get("model") != payload["model"]["model"]:
                 raise SystemExit("Assistant was saved but prompt/model verification failed. Inspect the Vapi dashboard.")
+            if verified.get("startSpeakingPlan") != payload["startSpeakingPlan"] or verified.get("firstMessage") != payload["firstMessage"]:
+                raise SystemExit("Assistant was saved but greeting/turn-taking verification failed. Inspect the Vapi dashboard.")
             path = ROOT / ".runtime" / f"vapi-{vertical}.json"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(payload, indent=2) + "\n")

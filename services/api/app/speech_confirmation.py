@@ -4,6 +4,12 @@ Only integer automaton states persist, never the utterance. Party, date, time an
 non-name terms must match (the reservation label "table" is optional). Names can
 differ in vowels or doubled consonants when their full phonetic code matches;
 this is not an identity/lookup check.
+
+How it works: the authoritative readback is compiled into a list of tokens, each a
+set of acceptable characters plus an 'optional' flag. The caller's speech is fed
+character by character through a small non-deterministic automaton (a set of active
+positions) that may begin matching at any point, so extra words before or after
+are tolerated. The progress is stored on the action payload as integer states.
 """
 GROUPS = ['bfpv', 'cgjkqsxz', 'dt', 'l', 'mn', 'r']
 SILENT = set('aeiouhyw')
@@ -11,6 +17,11 @@ CODES = {char: str(i) for i, group in enumerate(GROUPS) for char in group}
 
 
 def name_tokens(name):
+    """Compile a canonicalized name into automaton tokens with a Soundex-like phonetic tolerance.
+
+    Consonants in the same GROUPS are interchangeable, vowels/h/y/w are optional, and repeated codes
+    collapse, so 'Jon'/'John' match but a different consonant skeleton does not.
+    """
     if not name:
         return []
     tokens = [(set(name[0]), False), (SILENT, True)]
@@ -31,6 +42,13 @@ def name_tokens(name):
 
 
 def match_segment(action, text, canonicalize):
+    """Advance the readback matcher with new speech; True once the whole readback has matched.
+
+    Args: action (reads readback and payload['request']; writes payload['readback_states'] and
+    'readback_progress'), text (latest utterance chunk), canonicalize (normalizer for spoken text/numbers).
+    Only the numeric automaton state is persisted, never the utterance. Date, time, party size and other
+    terms must match exactly; only the name segment is phonetically tolerant.
+    """
     readback = action.readback.removeprefix('Please confirm: ')
     request = action.payload['request']
     name = request['name']
@@ -45,6 +63,7 @@ def match_segment(action, text, canonicalize):
         tokens = [(set(char), False) for char in canonicalize(readback)]
 
     def closure(states):
+        """Expand states across optional tokens (epsilon moves)."""
         states = set(states)
         for state in sorted(states):
             while state < len(tokens) and tokens[state][1]:
@@ -52,8 +71,10 @@ def match_segment(action, text, canonicalize):
                 states.add(state)
         return states
 
+    # Resume from persisted states so a readback can be matched across several utterances.
     active = closure(action.payload.get('readback_states', []))
     for char in canonicalize(text):
+        # Matching may restart at the beginning at any character (caller can say filler first).
         active = closure(active | {0})
         active = closure({state if tokens[state][1] else state + 1 for state in active if state < len(tokens) and char in tokens[state][0]})
         if len(tokens) in active:

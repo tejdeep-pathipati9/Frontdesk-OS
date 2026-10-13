@@ -1,3 +1,4 @@
+"""Call transcript retention and redaction rules."""
 import json
 from datetime import timedelta
 import pytest

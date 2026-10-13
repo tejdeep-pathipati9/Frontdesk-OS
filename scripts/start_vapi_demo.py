@@ -1,4 +1,11 @@
-"""Maintain one temporary webhook tunnel and reconnect saved Vapi assistants."""
+"""Maintain one temporary webhook tunnel and reconnect saved Vapi assistants.
+
+Usage: python scripts/start_vapi_demo.py   (no flags)
+Touches: reads .env (Vapi keys, webhook secret), spawns the tunnel binary, rewrites the
+public server URL in .env and updates saved Vapi assistants; takes a file lock so only
+one instance runs.
+Side effects: long-running subprocess/threads; recovers the tunnel if it drops.
+"""
 import fcntl
 import os
 import re
@@ -16,6 +23,7 @@ sys.path.insert(0, str(ROOT / 'services/api'))
 
 
 def webhook_ready(base, secret):
+    """Return True once the tunnelled webhook answers an authenticated probe."""
     from app.voice_readiness import check_webhook
     from app.domain import DomainError
     try:
@@ -25,6 +33,7 @@ def webhook_ready(base, secret):
 
 
 def maintain_tunnel(binary, secret, stopped):
+    """Keep a tunnel process alive, recording its URL in .env and restarting it if it drops."""
     while not stopped.is_set():
         tunnel = subprocess.Popen([binary, 'tunnel', '--url', 'http://127.0.0.1:8010', '--no-autoupdate', '--protocol', 'http2'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=ROOT)
         ready, address = threading.Event(), []
@@ -87,6 +96,7 @@ def maintain_tunnel(binary, secret, stopped):
 
 
 def main():
+    """CLI entry point: validate .env, run the tunnel and reconnect saved assistants."""
     values = dotenv_values(ROOT / '.env')
     if any(not values.get(key) for key in ['VAPI_PUBLIC_KEY', 'VAPI_PRIVATE_KEY', 'VAPI_WEBHOOK_SECRET']):
         raise SystemExit('Configure your Vapi keys and webhook secret in the ignored .env first.')

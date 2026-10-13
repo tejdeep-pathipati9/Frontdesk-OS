@@ -13,7 +13,7 @@ from app.models import Call, Customer, Location, PendingAction, now
 from app.schemas import PrepareAction
 
 
-@pytest.mark.parametrize('phone', ['202 555 0123', '(202) 555-0123', '12025550123', '+1 202 555 0123', '0012025550123', '', None])
+@pytest.mark.parametrize('phone', ['202 555 0123', '(202) 555-0123', '12025550123', '+1 202 555 0123', '0012025550123', 'two zero two five five five zero one two three', 'plus one two zero two five five five zero one two three', '', None])
 def test_phone_formats_and_optional_contact_preserve_booking(database, phone):
     with transaction(database) as db:
         loc = db.get(Location, 'demo-restaurant')
@@ -189,3 +189,74 @@ def test_action_specific_agreement_does_not_change_the_action_kind():
     assert not explicit_agreement('Please place the order.', 'reservation')
     assert explicit_agreement('Book the appointment.', 'appointment')
     assert not explicit_agreement('Book the appointment.', 'reservation')
+
+
+@pytest.mark.parametrize('spoken', ['40.28 US dollars', '40.28 United States dollars', 'forty dollars and twenty-eight cents', '40 dollars 28 cents'])
+def test_order_currency_pronunciation_preserves_exact_amount(spoken):
+    assert speech_key('total 40.28 USD, pickup 11:50 AM') == speech_key(f'total {spoken}, pickup 11 50 AM')
+
+
+@pytest.mark.parametrize('wrong', ['40.82 US dollars', '40 dollars and 29 cents', '40.28 euros', '40.28 Canadian dollars'])
+def test_order_currency_pronunciation_cannot_change_total_or_currency(wrong):
+    assert speech_key('total 40.28 USD') != speech_key(f'total {wrong}')
+
+
+def test_currency_normalization_preserves_zero_cents_and_decimal_place():
+    assert speech_key('total 40.00 USD') == speech_key('total forty US dollars')
+    assert speech_key('total 40.02 USD') == speech_key('total forty dollars and two cents')
+    assert speech_key('total 40.02 USD') != speech_key('total 40.2 US dollars')
+    assert speech_key('total 40.02 USD') != speech_key('total forty dollars and twenty cents')
+
+
+def test_us_phone_error_does_not_demand_country_code(voice_events):
+    _, tool = voice_events
+    result = tool('short-phone', 'prepare_action', {'kind': 'reservation', 'name': 'John', 'phone': '703453', 'start_at': (now() + timedelta(hours=4)).isoformat()})
+    assert result['code'] == 'PHONE_FORMAT_REQUIRED'
+    assert 'ten digits' in result['message']
+    assert 'do not need +1' in result['next_action']
+    assert result['completion_allowed'] is False
+
+
+@pytest.mark.parametrize('phone', ['+1703453', '+17034532872810', '703 4 by 3 2810', 'seven oh three four five three two eight sevens two eight one zero'])
+def test_incomplete_or_ambiguous_phone_digits_are_never_guessed(phone):
+    from app.phone import normalize_phone
+    with pytest.raises(ValueError):
+        normalize_phone(phone, '1')
+
+
+def test_order_readback_us_dollars_in_transcript_chunks_commits_once(voice_events, database):
+    event, tool = voice_events
+    proposal = tool('prepare-order', 'prepare_action', {'kind': 'order', 'name': 'John Smith', 'items': [{'item_id': 'menu-burger', 'quantity': 2}]})
+    assert proposal['completion_allowed'] is False
+    # Same segment boundaries as the real failed call: currency spoken as US dollars.
+    items, total = proposal['readback'].split(', total ')
+    event('order-items', type='transcript', transcriptType='final', role='assistant', transcript=items + ',')
+    event('order-total', type='transcript', transcriptType='final', role='assistant', transcript='Total ' + total.replace('USD', 'US dollars').replace(':', ' '))
+    event('order-yes', type='transcript', transcriptType='final', role='user', transcript='Yeah. Sounds good.')
+    result = tool('order-commit', 'commit_action', {'action_id': proposal['action_id']})
+    assert result['status'] == 'accepted' and result['completion_allowed'] is True, result
+    assert tool('order-replay', 'commit_action', {'action_id': proposal['action_id']})['id'] == result['id']
+    from app.models import Order
+    with database() as db:
+        assert len(list(db.scalars(select(Order).where(Order.id == result['id'])))) == 1
+
+
+@pytest.mark.parametrize('change', ['price', 'quantity', 'currency', 'pickup', 'incomplete'])
+def test_changed_or_incomplete_order_readback_cannot_confirm(voice_events, database, change):
+    event, tool = voice_events
+    proposal = tool('prepare-order', 'prepare_action', {'kind': 'order', 'name': 'John Smith', 'items': [{'item_id': 'menu-burger', 'quantity': 2}]})
+    spoken = proposal['readback']
+    if change == 'price':
+        spoken = spoken.split(', total ')[0] + ', total 1.00 USD, pickup ' + spoken.split(', pickup ')[1]
+    if change == 'quantity': spoken = spoken.replace('2 ', '3 ', 1)
+    if change == 'currency': spoken = spoken.replace('USD', 'EUR')
+    if change == 'pickup': spoken = spoken.replace(' AM', ' PM') if ' AM' in spoken else spoken.replace(' PM', ' AM')
+    if change == 'incomplete': spoken = spoken.split(', pickup ')[0]
+    event('order-readback', type='transcript', transcriptType='final', role='assistant', transcript=spoken)
+    event('order-yes', type='transcript', transcriptType='final', role='user', transcript='Yeah. Sounds good.')
+    result = tool('order-commit', 'commit_action', {'action_id': proposal['action_id']})
+    assert result['code'] == 'CONFIRMATION_REQUIRED' and result['completion_allowed'] is False
+    assert "hasn't been completed" in result['customer_message']
+    from app.models import Order
+    with database() as db:
+        assert not list(db.scalars(select(Order).where(Order.idempotency_key == proposal['action_id'])))

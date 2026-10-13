@@ -1,3 +1,4 @@
+"""Restaurant POS/integration sync, orders and polling."""
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from zoneinfo import ZoneInfo

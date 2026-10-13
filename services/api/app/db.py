@@ -1,3 +1,8 @@
+"""Database engine, session factory and the serialized write transaction.
+
+SQLite (default, WAL + foreign keys) or PostgreSQL. All business writes go through
+`transaction()` so capacity checks and commits cannot interleave.
+"""
 from contextlib import contextmanager
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
@@ -8,6 +13,7 @@ from .models import Base
 
 
 def make_engine(url):
+    """Build an engine; relative SQLite paths resolve against the repo root, not the CWD."""
     parsed = make_url(url)
     if parsed.drivername.startswith("sqlite") and parsed.database and parsed.database != ":memory:" and not Path(parsed.database).is_absolute():
         parsed = parsed.set(database=str((Path(__file__).resolve().parents[3] / parsed.database).resolve()))
@@ -34,6 +40,7 @@ def transaction(factory=Session):
     No network provider calls are performed inside this transaction.
     """
     with factory() as db:
+        # BEGIN IMMEDIATE takes the SQLite write lock up front; the PG advisory lock is released at commit/rollback.
         if db.bind.dialect.name == "sqlite":
             db.execute(text("BEGIN IMMEDIATE"))
         else:
@@ -47,6 +54,7 @@ def transaction(factory=Session):
 
 
 def init_db():
+    """Bring the schema up to date: Alembic-based adoption for SQLite, create_all for PostgreSQL."""
     if engine.dialect.name == "sqlite":
         from .local_schema import migrate_sqlite
         migrate_sqlite(engine)

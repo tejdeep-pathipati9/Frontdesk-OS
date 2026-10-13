@@ -2,6 +2,11 @@
 
 Chat context is transient process memory, expires after 30 minutes and is removed
 when a session ends. It is never presented as a LiveKit or Vapi voice call.
+
+Fit: powers the dashboard's text chat. Ollama only proposes tool calls; every tool
+runs through tools.execute_tool (the same path as Vapi/LiveKit), so FastAPI remains
+the sole business authority. A prepare-style tool returns an authoritative readback
+which ends the turn; the caller's next message is what confirms it.
 """
 import threading
 from dataclasses import dataclass, field
@@ -16,6 +21,7 @@ from .tools import TOOLS, AGENT_PROMPT, execute_tool
 
 @dataclass
 class Chat:
+    """Per-call in-memory conversation: message history, a non-blocking turn lock and a last-used time for expiry."""
     messages: list = field(default_factory=lambda: [{"role": "system", "content": AGENT_PROMPT + " This is a text-only local experiment. Never claim an audio call happened."}])
     lock: threading.Lock = field(default_factory=threading.Lock)
     last_used: object = field(default_factory=now)
@@ -25,6 +31,13 @@ chats: dict[str, Chat] = {}
 
 
 def run_chat(call_id, text, factory=Session):
+    """Run one user turn of the local text experiment and return {text, tool_results, provider, model}.
+
+    Args: call_id of an in-progress 'ollama_text' call; text the user message; factory a DB session factory.
+    Raises DomainError for concurrent turns (409), session length over 50 messages, ended calls, or an
+    unusable Ollama response (503). Side effects: records transcript turns and executes business tools in
+    their own transactions. Idle chats older than 30 minutes are evicted on entry.
+    """
     for id_, chat in list(chats.items()):
         if chat.last_used < now() - timedelta(minutes=30):
             chats.pop(id_, None)
@@ -58,6 +71,7 @@ def run_chat(call_id, text, factory=Session):
                 return {"text": content or "Please try asking a specific business question.", "tool_results": tool_results, "provider": "ollama_text", "model": settings().ollama_model}
             for index, requested in enumerate(message["tool_calls"][:8]):
                 function = requested.get("function", {})
+                # Before a commit runs, let the confirmation interpreter evaluate the caller's latest reply (never model-supplied text).
                 if function.get("name") == "commit_action":
                     from .confirmation_intent import resolve
                     resolve(call_id, factory)

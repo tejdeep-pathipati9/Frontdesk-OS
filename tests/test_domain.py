@@ -1,3 +1,4 @@
+"""Deterministic booking/capacity domain logic, idempotency and concurrency."""
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 import pytest

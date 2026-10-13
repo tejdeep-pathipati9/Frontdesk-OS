@@ -1,3 +1,4 @@
+"""Safety guards on writes and resource state."""
 from datetime import timedelta
 from sqlalchemy import select
 from app.db import transaction

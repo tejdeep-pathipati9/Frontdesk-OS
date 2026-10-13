@@ -1,4 +1,11 @@
-"""Prepare the local SQLite workspace without resetting records or voice keys."""
+"""Prepare the local SQLite workspace without resetting records or voice keys.
+
+Usage: python scripts/setup_local.py [--show-login]
+Flags: --show-login  print the local owner's credentials.
+Touches: creates/updates the ignored .env (missing keys only, via python-dotenv set_key)
+and initialises/seeds the local SQLite database.
+Side effects: writes .env and the database; existing records and keys are kept.
+"""
 import argparse
 import os
 import secrets
@@ -10,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
+    """CLI entry point: create missing .env keys and prepare the local database."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--show-login", action="store_true", help="Show the local owner's credentials")
     args = parser.parse_args()

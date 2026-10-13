@@ -1,3 +1,10 @@
+"""Download the Inter font files used by the web app.
+
+Usage: python scripts/download_frontend_font.py   (run from the repo root; no flags)
+Touches: writes inter-latin.woff2 and Inter-LICENSE.txt into apps/web/public/fonts/
+(created if missing), fetched over HTTPS with httpx.
+Side effects: network access and overwriting those two files.
+"""
 from pathlib import Path
 import httpx
 

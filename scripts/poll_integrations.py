@@ -1,5 +1,11 @@
 """Server-side polling worker for explicitly connected mock providers.
 
+Usage: python scripts/poll_integrations.py [--once] [--interval SECONDS]
+Flags: --once      run a single polling pass and exit (local verification)
+       --interval  seconds between passes (default 60)
+Touches: the configured application database via app.db.transaction.
+Side effects: applies normalized provider records to the database.
+
 Use --once for local verification. Live reads must fetch via authorized vendor
 clients outside the write transaction and then apply normalized records inside it.
 """

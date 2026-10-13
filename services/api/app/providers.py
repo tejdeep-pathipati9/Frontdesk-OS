@@ -2,6 +2,13 @@
 
     Local mutations remain internal until a reconciliation worker and mappings
     have been configured; provider writes never fall back to demo success.
+
+    Fit: these are the retained real Square/Toast REST clients. They are not used
+    for activation by integration_service (which only activates mocks); test()
+    reports connectivity/capability honestly for the settings UI. Every HTTP outcome
+    is mapped by provider_request into a status dict instead of raising, so callers
+    can distinguish timeouts (write outcome unknown -> pending_confirmation) from
+    hard failures.
 """
 from typing import Protocol
 import httpx
@@ -10,18 +17,26 @@ from .domain import DomainError
 
 
 class BookingProvider(Protocol):
+    """Structural contract for booking-capable vendors."""
     def get_availability(self, request: dict) -> dict: ...
     def create_booking(self, request: dict, idempotency_key: str) -> dict: ...
     def cancel_booking(self, reference: str, version: int) -> dict: ...
 
 
 class OrderProvider(Protocol):
+    """Structural contract for order-capable vendors."""
     def get_menu(self) -> dict: ...
     def submit_order(self, cart: dict, idempotency_key: str) -> dict: ...
     def get_order_status(self, reference: str) -> dict: ...
 
 
 def provider_request(method, url, *, headers=None, json=None):
+    """Perform one vendor HTTP call and normalize the outcome to a status dict (never raises on HTTP errors).
+
+    Returns {status: confirmed, data} on success; on timeout 'pending_confirmation' for writes (the
+    vendor may have applied it) or 'degraded' for GET; 401/403 -> needs_attention; other failures -> degraded
+    with an error_code. Timeout is 10s.
+    """
     try:
         response = httpx.request(method, url, headers=headers, json=json, timeout=10)
     except httpx.TimeoutException:
@@ -39,6 +54,7 @@ def provider_request(method, url, *, headers=None, json=None):
 
 
 class SquareAdapter:
+    """Square REST client (sandbox or production by config). Booking scopes are unverified, so capabilities are reported conservatively."""
     def __init__(self):
         cfg = settings()
         self.configured = bool(cfg.square_access_token and cfg.square_location_id)
@@ -46,11 +62,13 @@ class SquareAdapter:
         self.headers = {"Authorization": f"Bearer {cfg.square_access_token}", "Square-Version": cfg.square_api_version, "Content-Type": "application/json"}
 
     def request(self, method, route, body=None):
+        """Vendor call with auth headers; raises NOT_CONFIGURED (Square) or PROVIDER_AUTH_FAILED (Toast) when credentials are missing or rejected."""
         if not self.configured:
             raise DomainError("NOT_CONFIGURED", "Square credentials and location are required", 503)
         return provider_request(method, self.base + route, headers=self.headers, json=body)
 
     def test(self):
+        """Connectivity/capability probe for the settings UI; read-only, no mutations."""
         if not self.configured:
             return {"provider": "square", "mode": "not_configured", "capabilities": {"bookings_read": "not_configured", "bookings_write": "requires_permission", "table_occupancy": "unsupported"}}
         result = self.request("GET", f"/v2/locations/{settings().square_location_id}")
@@ -73,12 +91,14 @@ class SquareAdapter:
 
 
 class ToastAdapter:
+    """Toast REST client. Standard access is read-only; order writes are additionally behind toast_order_write_enabled."""
     def __init__(self):
         cfg = settings()
         self.configured = bool(cfg.toast_client_id and cfg.toast_client_secret and cfg.toast_restaurant_guid)
         self.base = cfg.toast_api_url.rstrip("/")
 
     def authenticate(self):
+        """Exchange client credentials for a Toast access token; raises PROVIDER_AUTH_FAILED if none is returned."""
         cfg = settings()
         if not self.configured:
             raise DomainError("NOT_CONFIGURED", "Toast authorized credentials are required", 503)
@@ -105,6 +125,7 @@ class ToastAdapter:
         return self.request("GET", "/menus/v2/menus")
 
     def submit_order(self, cart, idempotency_key):
+        """Submit an order; refuses (PROVIDER_WRITE_GATED) unless writes are enabled. The idempotency key is sent as externalId."""
         if not settings().toast_order_write_enabled:
             raise DomainError("PROVIDER_WRITE_GATED", "Toast order writes are disabled until authorized scopes are verified", 403)
         # Caller must pass a stable externalId in provider-format payload for lookup.

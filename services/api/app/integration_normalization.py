@@ -2,6 +2,12 @@
 
 Different mock payloads exercise the same normalized projection pipeline.
 POS payment/check activity deliberately carries no verified occupancy state.
+
+Fit: inbound mock webhook events are wrapped in an Envelope, validated against a
+strict per-vendor payload model (extra fields forbidden), and translated by
+normalize() into the provider-neutral record `data` shape consumed by
+integration_service.apply_record. Invalid payloads raise pydantic validation
+errors; unsupported provider/kind pairs raise UNSUPPORTED_CAPABILITY.
 """
 from datetime import datetime, timedelta
 from typing import Literal
@@ -10,6 +16,7 @@ from .domain import utc, DomainError
 
 
 class Envelope(BaseModel):
+    """Common event wrapper: location, unique event_id (for dedupe), kind, timezone-aware observed_at and raw vendor data."""
     model_config = ConfigDict(extra="forbid")
     location_id: str
     event_id: str = Field(min_length=1, max_length=90)
@@ -26,10 +33,12 @@ class Envelope(BaseModel):
 
 
 class StrictPayload(BaseModel):
+    """Base for vendor payloads; unknown fields are rejected rather than silently ignored."""
     model_config = ConfigDict(extra="forbid")
 
 
 class OpenTableReservation(StrictPayload):
+    """Mock OpenTable reservation webhook body."""
     guest_name: str = Field(min_length=1, max_length=100)
     party_size: int = Field(ge=1, le=30)
     scheduled_at: datetime
@@ -45,11 +54,13 @@ class OpenTableReservation(StrictPayload):
 
 
 class ToastSignal(StrictPayload):
+    """Mock Toast check-state signal; informational only, never proof a table is free or occupied."""
     table_guid: str
     check_state: Literal["OPEN", "CLOSED", "PAID"]
 
 
 class SquareCatalogItem(StrictPayload):
+    """Mock Square catalog item with integer minor-unit price and stock flag."""
     item_name: str = Field(min_length=1, max_length=100)
     category: str = Field(max_length=100)
     amount_minor: int = Field(ge=0, le=1000000)
@@ -57,6 +68,12 @@ class SquareCatalogItem(StrictPayload):
 
 
 def normalize(provider, event):
+    """Translate a vendor-specific event into the normalized record data for its kind.
+
+    Args: provider (mock provider id) and event (an Envelope). Returns the dict stored in
+    OperationalProjection.data. Pure function; no DB access. POS signals always set
+    availability_verified=False and only OPEN checks hint at possible occupancy.
+    """
     if provider == "mock_opentable" and event.kind == "reservation":
         body = OpenTableReservation.model_validate(event.data)
         return {"customer_name": body.guest_name, "party_size": body.party_size, "start_at": utc(body.scheduled_at).isoformat(), "end_at": utc(body.scheduled_at + timedelta(minutes=body.duration_minutes)).isoformat(), "unit_id": body.seating_id, "resources": [body.seating_id], "status": body.status}

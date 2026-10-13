@@ -1,3 +1,8 @@
+"""Record-to-dict conversion for API responses.
+
+Keeps JSON output consistent: datetimes become UTC ISO strings, and bookings are
+enriched with customer, resource and provider-projection details.
+"""
 from datetime import datetime
 from sqlalchemy import inspect, select
 from .domain import utc
@@ -5,6 +10,7 @@ from .models import Customer, Allocation, Resource, OperationalProjection, Call
 
 
 def serialize(record):
+    """Dict of all mapped columns; datetimes as UTC ISO strings. Adds `transcript_count` for Call."""
     result = {}
     for column in inspect(record).mapper.column_attrs:
         value = getattr(record, column.key)
@@ -15,6 +21,11 @@ def serialize(record):
 
 
 def booking_dict(db, row):
+    """Reservation/appointment dict with customer name, allocated resources and provenance.
+
+    For provider-owned bookings (external_id set), resources/timestamps come from the
+    read-only OperationalProjection and `is_projection` is true.
+    """
     data = serialize(row)
     customer = db.get(Customer, row.customer_id)
     data["customer_name"] = customer.display_name if customer else "Guest"

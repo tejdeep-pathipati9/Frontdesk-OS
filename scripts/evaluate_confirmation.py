@@ -1,4 +1,12 @@
-"""Read-only real-model evaluation. Uses synthetic utterances; creates no bookings."""
+"""Read-only real-model evaluation. Uses synthetic utterances; creates no bookings.
+
+Usage: python scripts/evaluate_confirmation.py [--model NAME] [--timeout SECONDS] [--output PATH]
+Flags: --model    installed local Ollama model (nothing is downloaded)
+       --timeout  per-classification timeout in seconds (default 3)
+       --output   report path (default .runtime/confirmation-evaluation.json)
+Touches: app.confirmation_intent.classify and the local Ollama server.
+Side effects: writes the JSON report only.
+"""
 import argparse
 import json
 import statistics
@@ -49,6 +57,7 @@ READBACKS = {
 
 
 def main():
+    """CLI entry point: classify synthetic utterances and write the evaluation report."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', help='Installed local model; no download is performed')
     parser.add_argument('--timeout', type=float, default=3)

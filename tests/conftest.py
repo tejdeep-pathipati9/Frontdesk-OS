@@ -1,3 +1,4 @@
+"""Shared pytest fixtures: isolated SQLite database and an authenticated demo client."""
 import sys
 from pathlib import Path
 import pytest
@@ -13,8 +14,11 @@ from app.config import settings
 
 @pytest.fixture
 def database(tmp_path, monkeypatch):
+    """Fresh seeded SQLite session factory in tmp_path with Ollama confirmation disabled."""
     monkeypatch.setattr(settings(), "ollama_confirmation_enabled", False)
+    from app import confirmation_intent
     from app.confirmation_intent import clear
+    monkeypatch.setattr(confirmation_intent, 'request_warm', lambda: None)
     clear()
     engine = storage.make_engine(f"sqlite:///{tmp_path / 'test.db'}")
     Base.metadata.create_all(engine)
@@ -28,6 +32,7 @@ def database(tmp_path, monkeypatch):
 
 @pytest.fixture
 def client(database, monkeypatch):
+    """TestClient bound to the temp database, already logged in via demo login."""
     monkeypatch.setattr(main, "Session", database)
     monkeypatch.setattr(auth, "Session", database)
     monkeypatch.setattr(main, "transaction", lambda: storage.transaction(database))

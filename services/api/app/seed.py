@@ -1,6 +1,12 @@
+"""Demo data: Momentuum Bistro (restaurant) and Studio Bloom (salon) under one demo tenant.
+
+`seed` is idempotent: on an existing workspace it only applies small renames/defaults and
+never resets history, location ids, voice mappings or capacity state.
+"""
 from datetime import timedelta
 from .models import Tenant, Membership, Location, Resource, Service, MenuItem, KitchenState, Reservation, Customer, Allocation, Event, now
 from .config import settings
+from .bistro_menu import add_bistro_menu
 
 DEMO_TENANT = "demo-tenant"
 RESTAURANT = "demo-restaurant"
@@ -8,6 +14,10 @@ SALON = "demo-salon"
 
 
 def seed(db):
+    """Create the demo tenant, owner, locations, tables, stylists, services, menu and sample bookings.
+
+    Caller owns the transaction. If the tenant already exists, only migrates names/defaults and returns.
+    """
     cfg = settings()
     tenant = db.get(Tenant, DEMO_TENANT)
     if tenant:
@@ -27,6 +37,8 @@ def seed(db):
         burger = db.get(MenuItem, "menu-burger")
         if burger and burger.name == "Juniper burger":
             burger.name = "Bistro burger"
+        if restaurant:
+            add_bistro_menu(db, restaurant)
         return
     db.add(Tenant(id=DEMO_TENANT, name=cfg.restaurant_name))
     db.add(Membership(id="demo-owner", tenant_id=DEMO_TENANT, email=cfg.owner_email, role="owner"))
@@ -49,6 +61,7 @@ def seed(db):
         ("menu-fries", "Rosemary fries", "Sides", 650, 1, "Sea salt, rosemary, house aioli", []),
         ("menu-lemonade", "House lemonade", "Drinks", 500, 1, "Fresh lemon, light cane sugar", [])]:
         db.add(MenuItem(id=item_id, tenant_id=DEMO_TENANT, location_id=RESTAURANT, name=name, category=category, price_minor=price, work_units=units, description=description, modifiers=mods))
+    add_bistro_menu(db, db.get(Location, RESTAURANT))
     db.add(KitchenState(id="demo-kitchen", tenant_id=DEMO_TENANT, location_id=RESTAURANT, capacity_per_bucket=12))
     db.add(Customer(id="seed-customer", tenant_id=DEMO_TENANT, display_name="Jamie Parker"))
     db.flush()

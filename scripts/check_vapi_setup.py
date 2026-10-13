@@ -1,4 +1,10 @@
-"""Read-only checks: public webhook isolation, auth and saved assistant mapping."""
+"""Read-only checks: public webhook isolation, auth and saved assistant mapping.
+
+Usage: python scripts/check_vapi_setup.py [--inspect-calls]
+Flags: --inspect-calls  additionally inspect recent Vapi calls.
+Touches: reads .env; probes the local gateway/API with services/api app.voice_readiness.post_probe.
+Side effects: none (no assistants, numbers or credentials are changed).
+"""
 from pathlib import Path
 import argparse
 import sys

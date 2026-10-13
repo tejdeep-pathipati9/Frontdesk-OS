@@ -1,4 +1,12 @@
-"""Optional LiveKit + Ollama agent. No independent business logic lives here."""
+"""Optional LiveKit + Ollama agent. No independent business logic lives here.
+
+Fit: a LiveKit worker joins a room dispatched by the FrontDesk session endpoint
+(job metadata carries call_id). It fetches the call contract (prompt, tool
+definitions, transcript notice) from the API using the agent bearer token, runs
+local STT/LLM/TTS, forwards each tool call to the API's agent endpoint and mirrors
+conversation turns to the transcript endpoint. Prices, capacity and confirmation
+are decided server-side; this process only relays.
+"""
 import asyncio
 import json
 import logging
@@ -17,6 +25,10 @@ server = AgentServer()
 
 
 class BusinessClient:
+    """Authenticated HTTP client for one call's FrontDesk API endpoints.
+
+    pending_events tracks in-flight transcript posts so tool calls and shutdown can wait for them.
+    """
     def __init__(self, call_id):
         self.call_id = call_id
         self.http = httpx.AsyncClient(base_url=os.getenv("FRONTDESK_API_URL", "http://127.0.0.1:8000") + "/api/v1", headers={"Authorization": "Bearer " + os.environ["AGENT_API_TOKEN"]}, timeout=15)
@@ -24,16 +36,23 @@ class BusinessClient:
         self.event_lock = asyncio.Lock()
 
     async def event(self, event):
+        """Post one transcript turn; serialized by a lock so turns arrive in order."""
         async with self.event_lock:
             response = await self.http.post(f"/voice/agent/calls/{self.call_id}/transcript", json=event)
             response.raise_for_status()
 
     async def tool(self, name, arguments):
+        """Invoke a business tool via the API and return its JSON result.
+
+        Retries once on timeout with the same request_id so the server can deduplicate; if still uncertain returns
+        a 'pending' result directing staff follow-up rather than claiming success.
+        """
         # Finish transcript processing before commit. Do not fabricate confirmation
         # from the model's tool arguments or from generated, unspoken readbacks.
         if self.pending_events:
             await asyncio.gather(*self.pending_events)
             self.pending_events.clear()
+        # Idempotency: reuse this id across the retry so a timed-out request is not executed twice.
         request_id = str(uuid4())
         payload = {"request_id": request_id, "name": name, "arguments": arguments}
         for attempt in range(2):
@@ -49,6 +68,7 @@ class BusinessClient:
 
 
 def make_tools(client, definitions):
+    """Wrap the API-provided tool definitions as LiveKit function tools that proxy to BusinessClient.tool."""
     tools = []
     for definition in definitions:
         def bind(name):
@@ -61,6 +81,11 @@ def make_tools(client, definitions):
 
 @server.rtc_session(agent_name="frontdesk-local")
 async def entrypoint(ctx: agents.JobContext):
+    """Per-room job: load the call contract, start the local voice session and greet the caller.
+
+    Raises if the dispatch lacks a call_id or the call is no longer in_progress. On shutdown flushes pending
+    transcript posts, then ends the call via the API.
+    """
     metadata = json.loads(ctx.job.metadata or "{}")
     call_id = metadata.get("call_id")
     if not call_id:
@@ -83,6 +108,7 @@ async def entrypoint(ctx: agents.JobContext):
     def conversation(event):
         if isinstance(event.item, ChatMessage) and event.item.role in ["user", "assistant"]:
             payload = {"event_id": event.item.id, "role": event.item.role, "text": event.item.text_content or "", "interrupted": bool(event.item.interrupted)}
+            # Post asynchronously but track the task so tool calls can wait for it.
             task = asyncio.create_task(client.event(payload))
             client.pending_events.append(task)
 

@@ -1,4 +1,10 @@
-"""Exercise full local flows against a disposable copy, never the dashboard DB."""
+"""Exercise full local flows against a disposable copy, never the dashboard DB.
+
+Usage: python scripts/rehearse_local.py   (no flags)
+Touches: copies the local SQLite database to a temp file and points DATABASE_URL at the
+copy before importing the app.
+Side effects: none on the real database; the copy is discarded afterwards.
+"""
 import os
 from pathlib import Path
 import sqlite3
@@ -14,6 +20,7 @@ sys.path.insert(0, str(ROOT / 'services/api'))
 
 
 def main():
+    """Run the rehearsal flows against a temporary copy of the local database."""
     from app.config import Settings
     cfg = Settings()
     parsed = make_url(cfg.database_url)

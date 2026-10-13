@@ -1,3 +1,4 @@
+"""API route behavior: auth, tenants, snapshots and tool executions."""
 from datetime import timedelta
 from sqlalchemy import select
 from app.models import Membership, Tenant, Location, ToolExecution, now

@@ -1,4 +1,10 @@
-"""Read-only public design-reference inspection. Does not operate a browser."""
+"""Read-only public design-reference inspection. Does not operate a browser.
+
+Usage: python scripts/inspect_reference.py   (no flags)
+Touches: reads .runtime/crm-reference.html, fetches the referenced public CSS over
+HTTPS from the reference site and prints structural hints.
+Side effects: writes the downloaded CSS files into .runtime/.
+"""
 from html.parser import HTMLParser
 from pathlib import Path
 import re

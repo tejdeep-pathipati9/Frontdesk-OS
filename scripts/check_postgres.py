@@ -1,4 +1,11 @@
-"""Verify the isolated Compose stack through its real HTTP API, including races."""
+"""Verify the isolated Compose stack through its real HTTP API, including races.
+
+Usage: python scripts/check_postgres.py   (no flags)
+Touches: the Compose API at http://127.0.0.1:18000/api/v1 (PostgreSQL-backed) using the
+OWNER_EMAIL/OWNER_PASSWORD values from the ignored .env.
+Side effects: creates bookings/holds in the Compose database while exercising
+concurrent-write races; never touches the native SQLite dashboard database.
+"""
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo

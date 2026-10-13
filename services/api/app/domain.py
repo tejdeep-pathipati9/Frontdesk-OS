@@ -1,4 +1,12 @@
-"""Deterministic capacity and confirmation logic, shared by UI/Vapi/LiveKit."""
+"""Deterministic capacity and confirmation logic, shared by UI/Vapi/LiveKit.
+
+The single business-rule engine (the LLM only proposes). Flow: `availability`/`slot`
+find resources (honouring hours, table combos, floor-state freshness, conflicts) ->
+`prepare` stores a server-held PendingAction with a readback -> `observe_transcript` /
+`confirm_staff` set `confirmed_at` -> `commit` re-validates and writes atomically.
+Functions take a SQLAlchemy session and must run inside `db.transaction()` for writes.
+Statuses: AVAILABLE / NO_CAPACITY / UNKNOWN (stale or unverified state: never assume free).
+"""
 import math
 import re
 from datetime import datetime, timedelta, timezone
@@ -9,6 +17,7 @@ from .schemas import Availability, PrepareAction, QuoteRequest
 
 
 class DomainError(Exception):
+    """Business-rule failure: stable `code`, human message, HTTP `status`, optional retryable flag and availability `decision`."""
     def __init__(self, code, message, status=409, retryable=False, decision=None):
         self.code, self.message, self.status, self.retryable = code, message, status, retryable
         self.decision = decision
@@ -16,24 +25,28 @@ class DomainError(Exception):
 
 
 def utc(value):
+    """Coerce an ISO string/naive/aware datetime to aware UTC (naive is assumed UTC)."""
     if isinstance(value, str):
         value = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
 def emit(db, loc, type_, payload=None, actor="system", target=""):
+    """Record an operational Event and matching AuditEvent in the caller's transaction."""
     event = Event(tenant_id=loc.tenant_id, location_id=loc.id, type=type_, payload=payload or {})
     db.add(event)
     db.add(AuditEvent(tenant_id=loc.tenant_id, location_id=loc.id, actor=actor, action=type_, target_id=target or loc.id, detail=payload or {}))
 
 
 def resources(db, loc):
+    """Location resources; tables are limited to the active floor source (manual vs `floor_provider`)."""
     rows = list(db.scalars(select(Resource).where(Resource.tenant_id == loc.tenant_id, Resource.location_id == loc.id).order_by(Resource.name)))
     provider = loc.settings.get("floor_provider")
     return [r for r in rows if r.kind != "table" or (r.attributes.get("source_provider") == provider if provider else not r.attributes.get("source_provider"))]
 
 
 def business_open(loc, start, end):
+    """True if [start, end] fits inside configured open/close hours in the location's timezone (0-24 = always open)."""
     zone = ZoneInfo(loc.timezone)
     local_start, local_end = utc(start).astimezone(zone), utc(end).astimezone(zone)
     opening, closing = loc.settings.get("open_hour", 9), loc.settings.get("close_hour", 22)
@@ -44,11 +57,16 @@ def business_open(loc, start, end):
     return local_start >= midnight + timedelta(hours=opening) and local_end <= close_at
 
 
-def freshness(loc, verified):
+def freshness(loc, verified, *, staff_managed=False):
+    """True if staff-verified state is recent enough (`freshness_minutes`), or persistent when staff-managed."""
+    if staff_managed and loc.settings.get("staff_state_persistent", False):
+        return True
     return (now() - utc(verified)).total_seconds() <= loc.settings.get("freshness_minutes", 30) * 60
 
 
 def conflict(db, loc, ids, start, end, exclude=None):
+    """True if any resource id has an overlapping live allocation; `exclude` ignores one reservation (reschedule)."""
+    # Half-open overlap test: existing.start < end and existing.end > start.
     query = select(Allocation.id).join(Reservation, Reservation.id == Allocation.reservation_id).where(
         Allocation.tenant_id == loc.tenant_id, Allocation.resource_id.in_(ids),
         Reservation.location_id == loc.id, Reservation.status.in_(["confirmed", "seated", "pending_confirmation"]),
@@ -60,6 +78,7 @@ def conflict(db, loc, ids, start, end, exclude=None):
 
 
 def table_sets(db, loc, party):
+    """Candidate table groups seating `party`: single tables plus configured combinations, smallest first."""
     tables = [r for r in resources(db, loc) if r.kind == "table"]
     by_id = {r.id: r for r in tables}
     candidates = [[r] for r in tables if r.capacity >= party]
@@ -72,7 +91,11 @@ def table_sets(db, loc, party):
 
 
 def table_needs_verification(loc, resource):
-    if not freshness(loc, resource.verified_at):
+    """True if a table's state cannot be trusted (staff-unverified, stale, or contradicted by a newer POS signal)."""
+    if resource.attributes.get("staff_verified") is False:
+        return True
+    staff_managed = not loc.settings.get("floor_provider") and not resource.attributes.get("source_provider")
+    if not freshness(loc, resource.verified_at, staff_managed=staff_managed):
         return True
     # A newer open POS check conflicts with an earlier staff-free observation.
     # It requests verification; it does not establish occupied or free status.
@@ -82,6 +105,7 @@ def table_needs_verification(loc, resource):
 
 
 def release_window(loc, resource):
+    """(earliest, latest) time a table is expected free, or None when unknown/unavailable. Never assumes an overdue table left."""
     if resource.state in ["out_of_service", "held"] or table_needs_verification(loc, resource):
         return None
     current = now()
@@ -102,6 +126,12 @@ def release_window(loc, resource):
 
 
 def slot(db, loc, query, exclude=None):
+    """Find a free resource group for `query`.
+
+    Returns (group | None, end_at, reason). reason is OUTSIDE_HOURS, STALE_STATE (some table state unknown)
+    or NO_COMPATIBLE_RESOURCE. Restaurants use turn+cleaning time and table release windows; salons use
+    service duration+buffer, stylist shifts and blocked ranges.
+    """
     start = utc(query.start_at)
     if loc.vertical == "restaurant":
         duration = loc.settings.get("turn_minutes", 75) + loc.settings.get("cleaning_minutes", 10)
@@ -142,7 +172,62 @@ def slot(db, loc, query, exclude=None):
     return None, end, "STALE_STATE" if unknown else "NO_COMPATIBLE_RESOURCE"
 
 
+def local_slot_labels(loc, result):
+    """Voice-ready business times alongside canonical timestamps; never reinterpret UTC as local."""
+    result = {**result, "timezone": loc.timezone}
+    for key in ["start_at", "end_at"]:
+        if not result.get(key):
+            continue
+        local = utc(result[key]).astimezone(ZoneInfo(loc.timezone))
+        hour = local.hour % 12 or 12
+        clock = f"{hour}:{local.minute:02d}" if local.minute else str(hour)
+        result[f"local_{key}"] = local.isoformat()
+        result[f"{key}_label"] = f"{local.strftime('%A, %B')} {local.day} at {clock} {'AM' if local.hour < 12 else 'PM'} {local.tzname()}"
+    result["alternatives"] = [local_slot_labels(loc, option) for option in result.get("alternatives", [])]
+    return result
+
+
 def availability(db, loc, query, exclude=None, alternatives=True, force_internal=False):
+    if query.search == "earliest":
+        return earliest_availability(db, loc, query, exclude, force_internal)
+    return local_slot_labels(loc, _availability(db, loc, query, exclude, alternatives, force_internal))
+
+
+def earliest_availability(db, loc, query, exclude=None, force_internal=False):
+    """Find the first slot on a 15-minute grid, using the exact-check authority.
+
+    An unknown earlier slot prevents claiming that a later slot is the earliest.
+    The full service duration must fit the requested window.
+    """
+    start = utc(query.start_at)
+    if query.end_at is None:
+        raise DomainError("SEARCH_WINDOW_REQUIRED", "Specify the end of the requested booking window", 422)
+    end = utc(query.end_at)
+    if end <= start or end - start > timedelta(days=1):
+        raise DomainError("INVALID_SEARCH_WINDOW", "Choose a search window of up to 24 hours", 422)
+    if start < now() - timedelta(seconds=30):
+        raise DomainError("PAST_TIME", "Choose a future search window", 422)
+    if start > now() + timedelta(days=90):
+        raise DomainError("BOOKING_HORIZON", "Bookings can be made up to 90 days ahead", 422)
+    cursor, checked, result = start, 0, None
+    while cursor < end:
+        candidate = query.model_copy(update={"start_at": cursor, "search": "exact", "end_at": None})
+        result = availability(db, loc, candidate, exclude, alternatives=False, force_internal=force_internal)
+        checked += 1
+        if result["status"] == "AVAILABLE" and utc(result["end_at"]) <= end:
+            return {**result, "search": "earliest", "search_start_at": start.isoformat(), "search_end_at": end.isoformat(), "slot_interval_minutes": 15, "slots_checked": checked}
+        if result["status"] == "UNKNOWN" or "INTAKE_PAUSED" in result.get("reason_codes", []):
+            return {**result, "search": "earliest", "slots_checked": checked}
+        cursor += timedelta(minutes=15)
+    return {"status": "NO_CAPACITY", "reason_codes": ["NO_SLOT_IN_WINDOW"], "alternatives": [], "timezone": loc.timezone, "search": "earliest", "search_start_at": start.isoformat(), "search_end_at": end.isoformat(), "slot_interval_minutes": 15, "slots_checked": checked, "evidence": result.get("evidence", {}) if result else {}, "permitted_actions": ["request_staff_booking"]}
+
+
+def _availability(db, loc, query, exclude=None, alternatives=True, force_internal=False):
+    """Availability decision dict: status, reason_codes, alternatives (up to 3, +15..240 min), evidence, permitted_actions.
+
+    Raises PAST_TIME / BOOKING_HORIZON. Delegates to the provider when booking authority is external unless
+    `force_internal`. `exclude` is a reservation id being moved.
+    """
     start = utc(query.start_at)
     if start < now() - timedelta(seconds=30):
         raise DomainError("PAST_TIME", "Choose a future time", 422)
@@ -171,6 +256,10 @@ def availability(db, loc, query, exclude=None, alternatives=True, force_internal
 
 
 def seating_wait(db, loc, party):
+    """Estimate restaurant wait as a min/max range by simulating the waitlist queue against table release windows.
+
+    Returns UNKNOWN rather than guessing when state is stale or no reliable release time exists.
+    """
     if loc.vertical != "restaurant":
         raise DomainError("WRONG_VERTICAL", "Seating wait is only available for restaurants", 422)
     if loc.settings.get("intake_paused"):
@@ -214,13 +303,18 @@ def seating_wait(db, loc, party):
 
 
 def quote(db, loc, request):
+    """Price a takeout cart and pick a 15-minute kitchen bucket with capacity (tax in basis points, minor units).
+
+    Raises DomainError for unknown/paused kitchen, invalid items/modifiers, or no capacity within 2 hours.
+    No writes; `commit` re-quotes to detect drift.
+    """
     if loc.vertical != "restaurant":
         raise DomainError("WRONG_VERTICAL", "Takeout is only supported at restaurant locations", 422)
     if loc.settings.get("catalog_provider"):
         from .integration_service import require_adapter
         require_adapter(db, loc, loc.settings["catalog_provider"], "menu_read")
     kitchen = db.scalar(select(KitchenState).where(KitchenState.location_id == loc.id, KitchenState.tenant_id == loc.tenant_id))
-    if not kitchen or not freshness(loc, kitchen.verified_at):
+    if not kitchen or not freshness(loc, kitchen.verified_at, staff_managed=True):
         raise DomainError("UNKNOWN_KITCHEN", "Kitchen state needs staff verification")
     if loc.settings.get("intake_paused") or not kitchen.kitchen_open or not kitchen.accepting_takeout:
         raise DomainError("KITCHEN_PAUSED", "The kitchen is not accepting takeout")
@@ -262,6 +356,11 @@ def quote(db, loc, request):
 
 
 def prepare(db, loc, request, call_id=None):
+    """Validate a request and create a PendingAction (5-minute expiry) with the spoken readback.
+
+    Handles reservation/appointment/order/cancel/reschedule. Change requests require matching reference and
+    phone. Supersedes earlier awaiting proposals on the same call. Nothing is booked here.
+    """
     from .phone import normalize_phone
     try:
         request = request.model_copy(update={"phone": normalize_phone(request.phone, loc.settings.get("phone_country_code"))})
@@ -334,6 +433,7 @@ def prepare(db, loc, request, call_id=None):
 
 
 def normalize(text):
+    """Lowercase and strip everything but a-z0-9 for lenient comparison."""
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
@@ -350,6 +450,21 @@ def speech_key(text):
             replacements[f"{tens} {ordinals[unit]}"] = str(value + unit)
     pattern = r"\b(?:" + "|".join(re.escape(word).replace(r"\ ", r"[\s-]+") for word in sorted(replacements, key=len, reverse=True)) + r")\b"
     text = re.sub(pattern, lambda m: replacements[re.sub(r"[\s-]+", " ", m[0])], text)
+    # TTS/transcribers expand USD to "US dollars". Treat these as the same
+    # currency, without dropping currency or changing the authoritative amount.
+    text = re.sub(r"\b(?:u\.?\s*s\.?\s*dollars?|united states dollars?|usd)\b", "usd", text)
+    # Only normalize monetary phrases after 'total'; item names stay literal.
+    # Forty dollars and twenty-eight cents == 40.28 USD, not 40.028/40.82.
+    def spoken_total(match):
+        dollars, cents = match.group(1), match.group(2)
+        return f"total {int(dollars)}.{int(cents):02d} usd"
+    text = re.sub(r"\btotal\s+(\d+)\s+(?:usd|dollars?)\s+(?:and\s+)?(\d{1,2})\s+cents?\b", spoken_total, text)
+    text = re.sub(r"\btotal\s+(\d+(?:\.\d{1,2})?)\s+dollars?\b", r"total \1 usd", text)
+    def minor_total(match):
+        dollars, _, cents = match.group(1).partition('.')
+        return f"total {int(dollars) * 100 + int(cents.ljust(2, '0') or '0')} usd"
+    # Preserve leading cent zeros before generic clock/date zero normalization.
+    text = re.sub(r"\btotal\s+(\d+(?:\.\d{1,2})?)\s+usd\b", minor_total, text)
     text = re.sub(r"\b(\d+)(?:st|nd|rd|th)\b", r"\1", text)
     text = re.sub(r"\b(\d{1,2}):00\s*(?=[ap][.\s]*m\b)", r"\1 ", text)
     text = re.sub(r"\b0+(\d+)", r"\1", text)
@@ -357,6 +472,7 @@ def speech_key(text):
 
 
 def explicit_agreement(text, kind=None):
+    """True only if the whole utterance is a closed-grammar agreement (see below); questions never qualify."""
     # A closed grammar accepts natural/repeated agreement, never arbitrary speech
     # containing "yes", corrections, conditions, or questions.
     if "?" in text:
@@ -368,10 +484,12 @@ def explicit_agreement(text, kind=None):
 
 
 def confirmation_help(text):
+    """True if the caller is asking how to confirm (not agreeing)."""
     return normalize(text) in {"howdoiconfirm", "howshouldiconfirm", "whatshouldisay", "whatdoisay", "doiconfirmyes", "anddoiconfirmyes", "doijustsayyes", "howmanytimesmusticonfirm"}
 
 
 def reset_readback(action):
+    """Discard confirmation progress so the readback must be heard in full again."""
     from .confirmation_intent import discard
     discard(action)
     action.readback_at, action.confirmed_at = None, None
@@ -379,6 +497,7 @@ def reset_readback(action):
 
 
 def interrupt_readback(action):
+    """Handle caller barge-in: keep a completed readback but clear consent, otherwise restart the readback."""
     # A caller can barge in with "yes" after the full readback. An interruption
     # alone is never consent, and incomplete readbacks must start over.
     if action.readback_at:
@@ -433,16 +552,25 @@ def observe_transcript(db, call, role, text):
 
 
 def confirm_staff(db, action):
+    """Staff-side confirmation: mark an unexpired awaiting action confirmed (bypasses the transcript check)."""
     if action.state != "awaiting_confirmation" or utc(action.expires_at) <= now():
         raise DomainError("ACTION_EXPIRED", "Prepare a fresh action before confirming")
     action.confirmed_at = now()
 
 
 def commit(db, loc, action):
+    """Execute a confirmed PendingAction; idempotent (a committed action returns its stored result).
+
+    Guards, in order: not expired/superseded, confirmed_at set, call still live and AI action not paused,
+    provider authority unchanged. Then re-checks capacity/quote/booking state at write time and raises
+    CAPACITY_CHANGED / RESOURCE_CHANGED / QUOTE_CHANGED / BOOKING_CHANGED if it drifted since the readback.
+    Writes the booking/order + Allocation rows, updates the Call and emits an event.
+    """
     if action.state in ["committed", "pending_confirmation"]:
-        return action.result
+        return action.result  # Idempotent replay.
     if action.state != "awaiting_confirmation" or utc(action.expires_at) <= now():
         raise DomainError("ACTION_EXPIRED", "The proposal has expired or was superseded")
+    # Confirmation guard: only confirmed_at (set from authenticated transcript or staff) permits a write.
     if not action.confirmed_at:
         raise DomainError("CONFIRMATION_REQUIRED", "Waiting for customer confirmation of the readback", retryable=True)
     if action.call_id:
@@ -525,6 +653,7 @@ def commit(db, loc, action):
 
 
 def lookup_order(db, loc, reference, phone):
+    """Return order status only when reference and normalized phone match exactly one order (else VERIFICATION_FAILED)."""
     from sqlalchemy import or_
     from .phone import normalize_phone
     try:

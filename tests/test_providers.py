@@ -1,3 +1,4 @@
+"""Square/Toast provider adapters and outbound request handling."""
 import httpx
 import pytest
 from app.providers import SquareAdapter, ToastAdapter, provider_request

@@ -1,3 +1,4 @@
+"""Reservation modify/cancel flows via pending actions."""
 from datetime import timedelta
 import pytest
 from app.db import transaction

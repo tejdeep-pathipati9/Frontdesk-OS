@@ -1,9 +1,15 @@
+"""Application settings loaded from environment / `.env` (see `.env.example`).
+
+Access through the cached `settings()`. Secrets default to empty/dev values; the
+integration blocks (Vapi, LiveKit, Ollama, Square, Toast) are optional.
+"""
 from functools import lru_cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    """Typed env-backed configuration; unknown env keys are ignored."""
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     database_url: str = "sqlite:///./frontdesk.db"
     demo_mode: bool = True
@@ -11,6 +17,7 @@ class Settings(BaseSettings):
     restaurant_name: str = "Momentuum Bistro"
     session_secret: str = "local-demo-only-change-before-live-use"
     owner_email: str = "owner@momentuumbistro.local"
+    owner_name: str = ""
     owner_password: str = ""
     web_origin: str = "http://127.0.0.1:3000"
     vapi_webhook_secret: str = ""
@@ -40,4 +47,5 @@ class Settings(BaseSettings):
 
 @lru_cache
 def settings():
+    """Process-wide cached Settings instance (restart or cache_clear to pick up env changes)."""
     return Settings()
