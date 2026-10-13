@@ -3,7 +3,6 @@ import { useState } from "react";
 import Link from "next/link";
 import { ChevronDown, Phone, Play, Settings2 } from "lucide-react";
 import VoiceLab, { type VoiceMode } from "./voice-lab";
-import { CallsPage } from "./calls-page";
 import { Panel } from "./shared/panel";
 import { Button } from "./ui/button";
 import { Dialog } from "./ui/dialog";
@@ -11,7 +10,7 @@ import { Badge, ErrorText } from "./workflows";
 import { mutation } from "@/lib/api";
 import type { Snapshot, VoiceConfig } from "@/lib/types";
 
-export function ReceptionistPage({ data, voice, onUpdated, onCall }: { data: Snapshot; voice: VoiceConfig | null; onUpdated: () => void; onCall: (id: string) => void }) {
+export function ReceptionistPage({ data, voice, onUpdated }: { data: Snapshot; voice: VoiceConfig | null; onUpdated: () => void }) {
   const [busy, setBusy] = useState(false); const [error, setError] = useState("");
   const [session, setSession] = useState<VoiceMode | null>(null);
   const [advanced, setAdvanced] = useState(false);
@@ -35,7 +34,6 @@ export function ReceptionistPage({ data, voice, onUpdated, onCall }: { data: Sna
         <div className="control-switches">{actions.map(action => { const enabled = data.location.settings.ai_actions?.[action.key] !== false; return <div className="control-switch-row" key={action.key}><div><strong>{action.label}</strong><p>{action.description}</p></div><button role="switch" aria-checked={enabled} aria-label={action.label} className={`switch ${enabled ? "on" : ""}`} disabled={busy} onClick={() => save({ ai_actions: { [action.key]: !enabled } })}><span /></button></div>; })}</div>
         <div className="receptionist-intake"><span>{data.location.settings.intake_paused ? data.location.vertical === "restaurant" ? "New reservations and orders are paused." : "New appointments are paused." : "New requests enabled."}</span><Button size="sm" variant="outline" disabled={busy} onClick={() => save({ intake_paused: !data.location.settings.intake_paused })}>{data.location.settings.intake_paused ? "Resume requests" : "Pause requests"}</Button></div>
       </Panel>
-      <CallsPage data={{ ...data, calls }} onOpen={onCall} compact />
     </div>
     <details className="panel receptionist-advanced" open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}>
       <summary><span><Settings2 size={15} />Advanced settings</span><ChevronDown size={15} /></summary>

@@ -67,7 +67,7 @@ export default function Dashboard({ vertical, section }: { vertical: "restaurant
       {section === "orders" && <OrderTable data={data} busy={busy} onCancel={order => setCancel({ kind: "order", id: order.id, name: order.customer_name })} />}
       {section === "calls" && <CallsPage data={data} onOpen={id => { void openCall(id); }} />}
       {section === "attention" && <AttentionQueue resources={data.resources} items={attention} timezone={data.location.timezone} onCall={id => { void openCall(id); }} onTable={id => setTableId(id)} onUpdated={() => { void refresh(); }} />}
-      {section === "voice" && <ReceptionistPage key={locationId} data={data} voice={voice} onUpdated={() => { void refresh(); }} onCall={id => { void openCall(id); }} />}
+      {section === "voice" && <ReceptionistPage key={locationId} data={data} voice={voice} onUpdated={() => { void refresh(); }} />}
       {section === "assistant" && <AssistantPage key={locationId} data={data} onCall={id => { void openCall(id); }} />}
       {section === "integrations" && <IntegrationsPage key={locationId} data={data} onUpdated={() => { void refresh(); }} />}
       {section === "menu" && <MenuPage data={data} busy={busy} onToggle={(id, available) => { void act(`/menu/${id}`, { available }, "PATCH", "Menu availability updated"); }} />}
